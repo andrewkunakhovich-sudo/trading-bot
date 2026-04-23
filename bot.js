@@ -608,21 +608,21 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
       price > ema8,
     );
 
-    // 3. RSI(3) pullback
+    // 3. RSI(3) deep pullback — requires strong oversold reading for high-quality snap-back
     check(
-      "RSI(3) below 30 (snap-back setup in uptrend)",
-      "< 30",
+      "RSI(3) below 28 (deep snap-back setup in uptrend)",
+      "< 28",
       rsi3.toFixed(2),
-      rsi3 < 35,
+      rsi3 < 28,
     );
 
-    // 4. Not overextended from VWAP
+    // 4. Price tightly anchored to VWAP — the closer, the better the risk/reward
     const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
     check(
-      "Price within 1.5% of VWAP (not overextended)",
-      "< 1.5%",
+      "Price within 0.8% of VWAP (tight to anchor)",
+      "< 0.8%",
       `${distFromVWAP.toFixed(2)}%`,
-      distFromVWAP < 1.5,
+      distFromVWAP < 0.8,
     );
   } else if (bearishBias) {
     console.log("  Bias: BEARISH — checking short entry conditions\n");
@@ -642,18 +642,18 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
     );
 
     check(
-      "RSI(3) above 70 (reversal setup in downtrend)",
-      "> 70",
+      "RSI(3) above 72 (deep overbought — reversal setup in downtrend)",
+      "> 72",
       rsi3.toFixed(2),
-      rsi3 > 65,
+      rsi3 > 72,
     );
 
     const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
     check(
-      "Price within 1.5% of VWAP (not overextended)",
-      "< 1.5%",
+      "Price within 0.8% of VWAP (tight to anchor)",
+      "< 0.8%",
       `${distFromVWAP.toFixed(2)}%`,
-      distFromVWAP < 1.5,
+      distFromVWAP < 0.8,
     );
   } else {
     console.log("  Bias: NEUTRAL — no clear direction. No trade.\n");
@@ -755,7 +755,10 @@ async function checkExits(symbol, positions, price, ema, vwap, rsi) {
   for (const pos of open) {
     // Update trailing high
     pos.highestPrice = Math.max(pos.highestPrice || pos.entryPrice, price);
-    const trailingStop = pos.highestPrice * 0.997;
+    // After partial exit, tighten trail to 0.15% to lock in remaining profit
+    const trailingStop = pos.halfTaken
+      ? pos.highestPrice * 0.9985
+      : pos.highestPrice * 0.997;
 
     // Partial profit — take 50% at 1.0% gain once (raised from 0.5% to let trades run)
     const gainPct = (price - pos.entryPrice) / pos.entryPrice * 100;
@@ -778,8 +781,8 @@ async function checkExits(symbol, positions, price, ema, vwap, rsi) {
     let exitReason = null;
 
     if (pos.side === "buy") {
-      if (gainPct >= 2.0) {
-        exitReason = `Take-profit — +${gainPct.toFixed(3)}% reached 2.0% target`;
+      if (gainPct >= 3.0) {
+        exitReason = `Take-profit — +${gainPct.toFixed(3)}% reached 3.0% target`;
       } else if (price <= trailingStop) {
         exitReason = `Trailing stop — price $${price.toFixed(2)} hit stop $${trailingStop.toFixed(2)} (peak was $${pos.highestPrice.toFixed(2)})`;
       } else if (rsi > 65) {
@@ -1153,12 +1156,12 @@ async function run() {
     continue;
   }
 
-  // Volume filter — use last completed candle (index -2); the last candle is in-progress on OKX
+  // Volume filter — require at or above average (active market only)
   const avgVolume = candles.slice(-21, -1).reduce((s, c) => s + c.volume, 0) / 20;
   const currentVolume = candles[candles.length - 2].volume;
   console.log(`  Volume: ${currentVolume.toFixed(0)} (avg: ${avgVolume.toFixed(0)}) ${currentVolume >= avgVolume ? "✅" : "🚫 below avg"}`);
-  if (currentVolume < avgVolume * 0.8) {
-    console.log(`  ⚠️  Volume too low — skipping.`);
+  if (currentVolume < avgVolume * 1.0) {
+    console.log(`  ⚠️  Volume below average — skipping.`);
     continue;
   }
 
@@ -1202,18 +1205,26 @@ async function run() {
     break;
   }
 
-  // 15m context — informational only, no longer blocks entry
+  // 1m bias — calculated once, used for 15m alignment + all downstream checks
+  const bias1m = price > vwap && price > ema8 ? "bullish" : "bearish";
+
+  // 15m bias — required to align with 1m direction (no counter-trend entries)
   try {
     const candles15m = await fetchCandles(symbol, "15m", 20);
     const closes15m = candles15m.map(c => c.close);
     const price15m = closes15m[closes15m.length - 1];
     const ema8_15m = calcEMA(closes15m, 8);
     const bias15m = price15m > ema8_15m ? "bullish" : "bearish";
-    console.log(`  15m bias: ${bias15m.toUpperCase()} (info only)`);
-  } catch {}
+    console.log(`  15m bias: ${bias15m.toUpperCase()}`);
+    if (bias1m !== bias15m) {
+      console.log(`  🚫 15m is ${bias15m.toUpperCase()} vs 1m ${bias1m.toUpperCase()} — counter-trend, skipping.`);
+      continue;
+    }
+  } catch {
+    console.log(`  ⚠️  Could not fetch 15m data — allowing entry.`);
+  }
 
   // Fear & Greed filter
-  const bias1m = price > vwap && price > ema8 ? "bullish" : "bearish";
   if (fearGreed.value < 20 && bias1m === "bullish") {
     console.log(`  🚫 Extreme Fear (${fearGreed.value}) — skipping long entry.`);
     continue;
