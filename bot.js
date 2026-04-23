@@ -398,6 +398,15 @@ function savePositions(positions) {
   writeFileSync(POSITIONS_FILE, JSON.stringify(positions, null, 2));
 }
 
+// Active trading sessions (UTC hours) — avoid dead/thin markets
+function isActiveSession() {
+  const hour = new Date().getUTCHours();
+  // London session: 07–16 UTC | US morning: 13–17 UTC | Asia open: 00–03 UTC
+  // Dead zone to avoid: 21–23 UTC (late US evening, markets winding down)
+  const dead = hour >= 21 && hour <= 23;
+  return !dead;
+}
+
 function countTodaysTrades(log) {
   const today = new Date().toISOString().slice(0, 10);
   return log.trades.filter(
@@ -760,8 +769,16 @@ async function checkExits(symbol, positions, price, ema, vwap, rsi) {
       ? pos.highestPrice * 0.9985
       : pos.highestPrice * 0.997;
 
-    // Partial profit — take 50% at 1.0% gain once (raised from 0.5% to let trades run)
     const gainPct = (price - pos.entryPrice) / pos.entryPrice * 100;
+
+    // Breakeven stop — once +0.5% up, the trade can never lose
+    if (!pos.breakevenSet && gainPct >= 0.5 && pos.side === "buy") {
+      pos.breakevenSet = true;
+      pos.stopPrice = pos.entryPrice;
+      console.log(`  🔒 Breakeven stop set at $${pos.entryPrice.toFixed(2)}`);
+    }
+
+    // Partial profit — take 50% at 1.0% gain once
     if (!pos.halfTaken && gainPct >= 1.0 && pos.side === "buy") {
       const halfQty = pos.quantity / 2;
       const halfPnl = (price - pos.entryPrice) * halfQty;
@@ -781,7 +798,13 @@ async function checkExits(symbol, positions, price, ema, vwap, rsi) {
     let exitReason = null;
 
     if (pos.side === "buy") {
-      if (gainPct >= 3.0) {
+      // Hard stop-loss — max -1.0% from entry, no exceptions
+      if (gainPct <= -1.0) {
+        exitReason = `Hard stop-loss — -${Math.abs(gainPct).toFixed(3)}% exceeded -1.0% limit`;
+      // Breakeven stop — exit if price falls back to entry after being up 0.5%
+      } else if (pos.breakevenSet && price < pos.stopPrice) {
+        exitReason = `Breakeven stop — price $${price.toFixed(2)} fell back to entry $${pos.entryPrice.toFixed(2)}`;
+      } else if (gainPct >= 3.0) {
         exitReason = `Take-profit — +${gainPct.toFixed(3)}% reached 3.0% target`;
       } else if (price <= trailingStop) {
         exitReason = `Trailing stop — price $${price.toFixed(2)} hit stop $${trailingStop.toFixed(2)} (peak was $${pos.highestPrice.toFixed(2)})`;
@@ -1120,6 +1143,18 @@ async function run() {
     continue;
   }
 
+  // ── Always check exits first — regardless of any entry filters ─────────────
+  {
+    const { positions: updatedPositions } = await checkExits(symbol, positions, price, ema8, vwap, rsi3);
+    positions = updatedPositions;
+    savePositions(positions);
+    const alreadyOpen = positions.some((p) => p.symbol === symbol);
+    if (alreadyOpen) {
+      console.log(`  ⏳ Position already open for ${symbol} — holding.`);
+      continue;
+    }
+  }
+
   // ATR-based position sizing (multiplier applied later after social/on-chain checks)
   const atr = calcATR(candles, 14);
   const riskAmount = CONFIG.portfolioValue * 0.01;
@@ -1185,16 +1220,31 @@ async function run() {
   console.log(`  Social: ${social.sentiment.toUpperCase()} (${social.bullishPct}% bullish on Stocktwits)`);
   if (orderBookRatio !== null) console.log(`  Order book: ${(orderBookRatio * 100).toFixed(1)}% bid pressure ${orderBookRatio > 0.55 ? "📈" : orderBookRatio < 0.45 ? "📉" : "➖"}`);
 
-  // Check exits for any open positions on this symbol
-  const { positions: updatedPositions } = await checkExits(symbol, positions, price, ema8, vwap, rsi3);
-  positions = updatedPositions;
-  savePositions(positions);
 
-  // Skip entry if already in a position on this symbol
-  const alreadyOpen = positions.some((p) => p.symbol === symbol);
-  if (alreadyOpen) {
-    console.log(`  ⏳ Position already open for ${symbol} — holding.`);
+  // ── Entry-only filters (exits above already ran) ────────────────────────────
+
+  // Time-of-day filter — skip new entries during dead market hours (21–23 UTC)
+  if (!isActiveSession()) {
+    console.log(`  ⚠️  Dead market hours (UTC ${new Date().getUTCHours()}:xx) — no new entries.`);
     continue;
+  }
+
+  // Max concurrent positions — keep focus on the best 3 setups
+  if (positions.length >= 3) {
+    console.log(`  ⚠️  3 positions already open — not adding more.`);
+    continue;
+  }
+
+  // Momentum candle — last completed candle must show buying reversal, not still falling
+  const lastCandle = candles[candles.length - 2];
+  const prevCandle = candles[candles.length - 3];
+  if (symbol.endsWith("USDT")) {
+    const bullishReversal = lastCandle.close > lastCandle.open;
+    const sellingExhaustion = prevCandle && lastCandle.low < prevCandle.low && lastCandle.close > prevCandle.close;
+    if (!bullishReversal && !sellingExhaustion) {
+      console.log(`  ⚠️  No reversal candle — still bearish. Waiting for buyers.`);
+      continue;
+    }
   }
 
   // Daily loss limit
