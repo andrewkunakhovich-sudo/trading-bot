@@ -13,6 +13,259 @@ import "dotenv/config";
 import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
 import crypto from "crypto";
 import { execSync } from "child_process";
+import WebSocket from "ws";
+
+// ─── News Sentiment ──────────────────────────────────────────────────────────
+
+const NEWS_FEEDS = {
+  crypto: [
+    "https://cointelegraph.com/rss",
+    "https://coindesk.com/arc/outboundfeeds/rss/",
+  ],
+  stocks: [
+    "https://feeds.finance.yahoo.com/rss/2.0/headline?s=^GSPC&region=US&lang=en-US",
+    "https://feeds.reuters.com/reuters/businessNews",
+  ],
+};
+
+async function fetchNewsHeadlines(isCrypto) {
+  const feeds = isCrypto ? NEWS_FEEDS.crypto : NEWS_FEEDS.stocks;
+  const headlines = [];
+  const cutoff = Date.now() - 30 * 60 * 1000; // last 30 minutes
+
+  for (const url of feeds) {
+    try {
+      const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+      const text = await res.text();
+      const items = [...text.matchAll(/<item>([\s\S]*?)<\/item>/g)];
+      for (const [, item] of items) {
+        const title = item.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/)?.[1]
+          || item.match(/<title>(.*?)<\/title>/)?.[1] || "";
+        const pubDate = item.match(/<pubDate>(.*?)<\/pubDate>/)?.[1] || "";
+        const date = pubDate ? new Date(pubDate).getTime() : Date.now();
+        if (date >= cutoff && title) headlines.push(title.trim());
+      }
+    } catch {
+      // feed unavailable — skip
+    }
+  }
+  return headlines;
+}
+
+async function analyzeNewsSentiment(symbol, headlines) {
+  if (!process.env.GROQ_API_KEY || headlines.length === 0) return { sentiment: "neutral", confidence: "low", reason: "no headlines" };
+
+  const coin = symbol.replace("USDT", "").replace("USD", "");
+  const relevant = headlines.filter(h => h.toLowerCase().includes(coin.toLowerCase()) || h.toLowerCase().includes("crypto") || h.toLowerCase().includes("bitcoin"));
+  if (relevant.length === 0) return { sentiment: "neutral", confidence: "low", reason: "no relevant headlines" };
+
+  const prompt = `You are a trading news analyst. Analyze these recent headlines for ${coin} and return ONLY a JSON object with keys: sentiment ("positive", "negative", or "neutral"), confidence ("high", "medium", or "low"), reason (one short sentence).
+
+Headlines:
+${relevant.slice(0, 5).map((h, i) => `${i + 1}. ${h}`).join("\n")}
+
+Return only valid JSON, nothing else.`;
+
+  try {
+    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.GROQ_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: "llama3-8b-8192",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.1,
+        max_tokens: 150,
+      }),
+    });
+    const data = await res.json();
+    const text = data.choices?.[0]?.message?.content || "{}";
+    const json = JSON.parse(text.match(/\{[\s\S]*\}/)?.[0] || "{}");
+    return { sentiment: json.sentiment || "neutral", confidence: json.confidence || "low", reason: json.reason || "" };
+  } catch {
+    return { sentiment: "neutral", confidence: "low", reason: "sentiment analysis failed" };
+  }
+}
+
+// ─── Fear & Greed Index ──────────────────────────────────────────────────────
+
+async function fetchFearGreed() {
+  try {
+    const res = await fetch("https://api.alternative.me/fng/?limit=1");
+    const data = await res.json();
+    const item = data.data?.[0];
+    return { value: parseInt(item?.value || 50), label: item?.value_classification || "Neutral" };
+  } catch { return { value: 50, label: "Neutral" }; }
+}
+
+// ─── Economic Calendar ────────────────────────────────────────────────────────
+
+async function fetchEconomicEvents() {
+  try {
+    const res = await fetch("https://nfs.faireconomy.media/ff_calendar_thisweek.json", { headers: { "User-Agent": "Mozilla/5.0" } });
+    const events = await res.json();
+    const now = Date.now();
+    const window = 30 * 60 * 1000;
+    return events.filter(e => e.impact === "High" && Math.abs(new Date(e.date).getTime() - now) < window);
+  } catch { return []; }
+}
+
+// ─── Social Sentiment (Stocktwits) ───────────────────────────────────────────
+
+async function fetchSocialSentiment(symbol) {
+  const stwSymbol = symbol.replace("USDT", "").replace("USD", "") + ".X";
+  try {
+    const res = await fetch(`https://api.stocktwits.com/api/2/streams/symbol/${stwSymbol}.json`);
+    const data = await res.json();
+    const messages = data.messages || [];
+    const bullish = messages.filter(m => m.entities?.sentiment?.basic === "Bullish").length;
+    const bearish = messages.filter(m => m.entities?.sentiment?.basic === "Bearish").length;
+    const total = bullish + bearish;
+    if (total === 0) return { sentiment: "neutral", bullishPct: 50 };
+    const bullishPct = Math.round(bullish / total * 100);
+    return { sentiment: bullishPct > 60 ? "bullish" : bullishPct < 40 ? "bearish" : "neutral", bullishPct };
+  } catch { return { sentiment: "neutral", bullishPct: 50 }; }
+}
+
+// ─── On-Chain / Global Market Data (CoinGecko) ───────────────────────────────
+
+async function fetchOnChainData() {
+  try {
+    const res = await fetch("https://api.coingecko.com/api/v3/global");
+    const data = await res.json();
+    const g = data.data;
+    return {
+      btcDominance: g.market_cap_percentage?.btc || 50,
+      marketChange24h: g.market_cap_change_percentage_24h_usd || 0,
+    };
+  } catch { return null; }
+}
+
+// ─── Self-Learning ────────────────────────────────────────────────────────────
+
+const LEARNED_FILE = "learned-adjustments.json";
+
+function loadLearned() {
+  if (!existsSync(LEARNED_FILE)) return { excludedSymbols: [], positionMultipliers: {} };
+  try { return JSON.parse(readFileSync(LEARNED_FILE, "utf8")); } catch { return { excludedSymbols: [], positionMultipliers: {} }; }
+}
+
+// ─── Weekly Loss Limit ────────────────────────────────────────────────────────
+
+function getWeeklyPnl() {
+  const data = loadDailyPnl();
+  const weekAgo = new Date();
+  weekAgo.setDate(weekAgo.getDate() - 7);
+  return Object.entries(data)
+    .filter(([date]) => new Date(date) >= weekAgo)
+    .reduce((sum, [, d]) => sum + (d.total || 0), 0);
+}
+
+// ─── Per-Symbol Cooldowns ─────────────────────────────────────────────────────
+
+const COOLDOWNS_FILE = "cooldowns.json";
+
+function loadCooldowns() {
+  if (!existsSync(COOLDOWNS_FILE)) return {};
+  try { return JSON.parse(readFileSync(COOLDOWNS_FILE, "utf8")); } catch { return {}; }
+}
+
+function saveCooldowns(c) { writeFileSync(COOLDOWNS_FILE, JSON.stringify(c, null, 2)); }
+
+function isOnCooldown(symbol) {
+  const c = loadCooldowns()[symbol];
+  if (!c) return false;
+  return new Date(c.pauseUntil) > new Date();
+}
+
+function recordLoss(symbol) {
+  const cooldowns = loadCooldowns();
+  if (!cooldowns[symbol]) cooldowns[symbol] = { consecutiveLosses: 0, pauseUntil: null };
+  cooldowns[symbol].consecutiveLosses++;
+  if (cooldowns[symbol].consecutiveLosses >= 3) {
+    const until = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    cooldowns[symbol].pauseUntil = until.toISOString();
+    console.log(`  🔴 ${symbol} on 24h cooldown after 3 consecutive losses.`);
+  }
+  saveCooldowns(cooldowns);
+}
+
+function recordWin(symbol) {
+  const cooldowns = loadCooldowns();
+  if (cooldowns[symbol]) { cooldowns[symbol].consecutiveLosses = 0; saveCooldowns(cooldowns); }
+}
+
+// ─── Order Book Imbalance (OKX) ───────────────────────────────────────────────
+
+async function fetchOrderBookImbalance(symbol) {
+  try {
+    const okxSymbol = OKX_SYMBOL_MAP[symbol] || symbol;
+    const instId = okxSymbol.replace("USDT", "-USDT");
+    const res = await fetch(`https://www.okx.com/api/v5/market/books?instId=${instId}&sz=20`);
+    const data = await res.json();
+    if (data.code !== "0") return null;
+    const book = data.data?.[0];
+    if (!book) return null;
+    const bidVol = book.bids.reduce((s, b) => s + parseFloat(b[1]), 0);
+    const askVol = book.asks.reduce((s, a) => s + parseFloat(a[1]), 0);
+    const total = bidVol + askVol;
+    return total > 0 ? bidVol / total : 0.5;
+  } catch { return null; }
+}
+
+// ─── Alpaca Stock Execution ───────────────────────────────────────────────────
+
+async function placeAlpacaOrder(symbol, side, qty) {
+  if (!process.env.ALPACA_API_KEY || !process.env.ALPACA_SECRET_KEY) return null;
+  const res = await fetch("https://paper-api.alpaca.markets/v2/orders", {
+    method: "POST",
+    headers: {
+      "APCA-API-KEY-ID": process.env.ALPACA_API_KEY,
+      "APCA-API-SECRET-KEY": process.env.ALPACA_SECRET_KEY,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ symbol, qty: qty.toFixed(4), side, type: "market", time_in_force: "day" }),
+  });
+  const data = await res.json();
+  if (data.code) throw new Error(`Alpaca error: ${data.message}`);
+  return data;
+}
+
+// ─── TradingView Chart Switcher ───────────────────────────────────────────────
+
+async function switchTradingViewChart(symbol) {
+  try {
+    const res = await fetch("http://localhost:9222/json");
+    if (!res.ok) return;
+    const pages = await res.json();
+    const chart = pages.find(p => p.url && p.url.includes("tradingview.com/chart"));
+    if (!chart) return;
+
+    // Map symbol to TradingView format (BTCUSDT → BITSTAMP:BTCUSD)
+    const tvSymbol = symbol
+      .replace("USDT", "USD")
+      .replace("BTC", "BTC");
+    const tvUrl = `https://www.tradingview.com/chart/?symbol=KRAKEN:${tvSymbol}&interval=1`;
+
+    const ws = new WebSocket(chart.webSocketDebuggerUrl);
+    await new Promise((resolve, reject) => {
+      ws.on("open", () => {
+        ws.send(JSON.stringify({
+          id: 1,
+          method: "Runtime.evaluate",
+          params: { expression: `window.location.href = '${tvUrl}';` }
+        }));
+        setTimeout(() => { ws.close(); resolve(); }, 1000);
+      });
+      ws.on("error", reject);
+    });
+    console.log(`  📺 TradingView switched to ${tvSymbol}`);
+  } catch {
+    // TradingView not open — silently skip
+  }
+}
 
 // ─── Onboarding ───────────────────────────────────────────────────────────────
 
@@ -20,7 +273,8 @@ function checkOnboarding() {
   const required = ["BITGET_API_KEY", "BITGET_SECRET_KEY", "BITGET_PASSPHRASE"];
   const missing = required.filter((k) => !process.env[k]);
 
-  if (!existsSync(".env")) {
+  // On Railway, credentials come from env vars — no .env file exists and that's fine
+  if (!process.env.RAILWAY_ENVIRONMENT && !existsSync(".env")) {
     console.log(
       "\n⚠️  No .env file found — opening it for you to fill in...\n",
     );
@@ -73,7 +327,10 @@ function checkOnboarding() {
 
 const CONFIG = {
   symbol: process.env.SYMBOL || "BTCUSDT",
-  timeframe: process.env.TIMEFRAME || "4H",
+  symbols: (process.env.SYMBOLS || process.env.SYMBOL || "BTCUSDT").split(",").map(s => s.trim()),
+  stocks: process.env.STOCKS ? process.env.STOCKS.split(",").map(s => s.trim()) : [],
+  stockIndicators: { emaPeriod: 20, rsiPeriod: 14, rsiOversold: 40, rsiOverbought: 60, vwapDistPct: 2.0 },
+  timeframe: process.env.TIMEFRAME || "1m",
   portfolioValue: parseFloat(process.env.PORTFOLIO_VALUE_USD || "1000"),
   maxTradeSizeUSD: parseFloat(process.env.MAX_TRADE_SIZE_USD || "100"),
   maxTradesPerDay: parseInt(process.env.MAX_TRADES_PER_DAY || "3"),
@@ -88,16 +345,57 @@ const CONFIG = {
 };
 
 const LOG_FILE = "safety-check-log.json";
+const POSITIONS_FILE = "positions.json";
+const DAILY_PNL_FILE = "daily-pnl.json";
+
+function loadDailyPnl() {
+  if (!existsSync(DAILY_PNL_FILE)) return {};
+  return JSON.parse(readFileSync(DAILY_PNL_FILE, "utf8"));
+}
+
+function recordDailyPnl(symbol, pnlUSD) {
+  const today = new Date().toISOString().slice(0, 10);
+  const hour = new Date().toISOString().slice(11, 13);
+  const data = loadDailyPnl();
+  if (!data[today]) data[today] = { total: 0, bySymbol: {}, byHour: {} };
+  data[today].total = (data[today].total || 0) + pnlUSD;
+  if (!data[today].bySymbol[symbol]) data[today].bySymbol[symbol] = { pnl: 0, trades: 0, wins: 0 };
+  data[today].bySymbol[symbol].pnl += pnlUSD;
+  data[today].bySymbol[symbol].trades++;
+  if (pnlUSD > 0) data[today].bySymbol[symbol].wins++;
+  if (!data[today].byHour[hour]) data[today].byHour[hour] = { pnl: 0, trades: 0 };
+  data[today].byHour[hour].pnl += pnlUSD;
+  data[today].byHour[hour].trades++;
+  writeFileSync(DAILY_PNL_FILE, JSON.stringify(data, null, 2));
+  return data[today].total;
+}
+
+function getTodayPnl() {
+  const today = new Date().toISOString().slice(0, 10);
+  const d = loadDailyPnl()[today];
+  return d ? (d.total || 0) : 0;
+}
 
 // ─── Logging ────────────────────────────────────────────────────────────────
 
 function loadLog() {
   if (!existsSync(LOG_FILE)) return { trades: [] };
-  return JSON.parse(readFileSync(LOG_FILE, "utf8"));
+  // Strip UTF-8 BOM if present (written by some editors on Windows)
+  const text = readFileSync(LOG_FILE, "utf8").replace(/^﻿/, "");
+  try { return JSON.parse(text); } catch { return { trades: [] }; }
 }
 
 function saveLog(log) {
   writeFileSync(LOG_FILE, JSON.stringify(log, null, 2));
+}
+
+function loadPositions() {
+  if (!existsSync(POSITIONS_FILE)) return [];
+  return JSON.parse(readFileSync(POSITIONS_FILE, "utf8"));
+}
+
+function savePositions(positions) {
+  writeFileSync(POSITIONS_FILE, JSON.stringify(positions, null, 2));
 }
 
 function countTodaysTrades(log) {
@@ -107,30 +405,28 @@ function countTodaysTrades(log) {
   ).length;
 }
 
-// ─── Market Data (Binance public API — free, no auth) ───────────────────────
+// OKX uses different tickers for some rebranded tokens
+const OKX_SYMBOL_MAP = {
+  "MATICUSDT": "POLUSDT", // Polygon renamed to POL
+};
+
+// ─── Market Data (OKX public API — free, no auth, accessible globally) ───────
 
 async function fetchCandles(symbol, interval, limit = 100) {
-  // Map our timeframe format to Binance interval format
-  const intervalMap = {
-    "1m": "1m",
-    "3m": "3m",
-    "5m": "5m",
-    "15m": "15m",
-    "30m": "30m",
-    "1H": "1h",
-    "4H": "4h",
-    "1D": "1d",
-    "1W": "1w",
-  };
-  const binanceInterval = intervalMap[interval] || "1m";
-
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceInterval}&limit=${limit}`;
+  const okxSymbol = OKX_SYMBOL_MAP[symbol] || symbol;
+  // OKX instId format: BTC-USDT, ETH-USDT, etc.
+  const instId = okxSymbol.replace("USDT", "-USDT");
+  // OKX bar format matches our config format exactly: 1m, 3m, 15m, 1H, 4H, 1D, 1W
+  const bar = interval;
+  // OKX max is 300 candles per request; returns newest-first so we reverse
+  const url = `https://www.okx.com/api/v5/market/candles?instId=${instId}&bar=${bar}&limit=${Math.min(limit, 300)}`;
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Binance API error: ${res.status}`);
+  if (!res.ok) throw new Error(`OKX API error: ${res.status}`);
   const data = await res.json();
+  if (data.code !== "0") throw new Error(`OKX API error: ${data.msg}`);
 
-  return data.map((k) => ({
-    time: k[0],
+  return data.data.reverse().map((k) => ({
+    time: parseInt(k[0]),
     open: parseFloat(k[1]),
     high: parseFloat(k[2]),
     low: parseFloat(k[3]),
@@ -139,7 +435,42 @@ async function fetchCandles(symbol, interval, limit = 100) {
   }));
 }
 
+// ─── Stock Market Data (Yahoo Finance — no API key needed) ───────────────────
+
+async function fetchStockCandles(ticker, limit = 100) {
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1m&range=1d`;
+  const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+  if (!res.ok) throw new Error(`Yahoo Finance error: ${res.status}`);
+  const data = await res.json();
+  const result = data.chart?.result?.[0];
+  if (!result) throw new Error(`No data returned for ${ticker}`);
+  const timestamps = result.timestamp || [];
+  const quotes = result.indicators?.quote?.[0] || {};
+  const candles = timestamps.map((t, i) => ({
+    time: t * 1000,
+    open: quotes.open?.[i] || 0,
+    high: quotes.high?.[i] || 0,
+    low: quotes.low?.[i] || 0,
+    close: quotes.close?.[i] || 0,
+    volume: quotes.volume?.[i] || 0,
+  })).filter(c => c.close > 0);
+  return candles.slice(-limit);
+}
+
 // ─── Indicator Calculations ──────────────────────────────────────────────────
+
+function calcEMAArray(closes, period) {
+  if (closes.length < period) return [];
+  const multiplier = 2 / (period + 1);
+  const result = [];
+  let ema = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  result.push(ema);
+  for (let i = period; i < closes.length; i++) {
+    ema = closes[i] * multiplier + ema * (1 - multiplier);
+    result.push(ema);
+  }
+  return result;
+}
 
 function calcEMA(closes, period) {
   const multiplier = 2 / (period + 1);
@@ -164,6 +495,66 @@ function calcRSI(closes, period = 14) {
   if (avgLoss === 0) return 100;
   const rs = avgGain / avgLoss;
   return 100 - 100 / (1 + rs);
+}
+
+function calcATR(candles, period = 14) {
+  if (candles.length < period + 1) return null;
+  const trs = [];
+  for (let i = 1; i < candles.length; i++) {
+    trs.push(Math.max(
+      candles[i].high - candles[i].low,
+      Math.abs(candles[i].high - candles[i - 1].close),
+      Math.abs(candles[i].low - candles[i - 1].close)
+    ));
+  }
+  return trs.slice(-period).reduce((a, b) => a + b, 0) / period;
+}
+
+function calcMACD(closes, fast = 12, slow = 26, signal = 9) {
+  if (closes.length < slow + signal) return null;
+  const emaFast = calcEMAArray(closes, fast);
+  const emaSlow = calcEMAArray(closes, slow);
+  const offset = slow - fast;
+  const macdLine = emaSlow.map((v, i) => emaFast[i + offset] - v);
+  const signalLine = calcEMAArray(macdLine, signal);
+  return {
+    macd: macdLine[macdLine.length - 1],
+    signal: signalLine[signalLine.length - 1],
+    histogram: macdLine[macdLine.length - 1] - signalLine[signalLine.length - 1],
+  };
+}
+
+function calcBollingerBands(closes, period = 20, multiplier = 2) {
+  if (closes.length < period) return null;
+  const slice = closes.slice(-period);
+  const middle = slice.reduce((a, b) => a + b, 0) / period;
+  const stdDev = Math.sqrt(slice.reduce((sum, v) => sum + Math.pow(v - middle, 2), 0) / period);
+  return { upper: middle + multiplier * stdDev, middle, lower: middle - multiplier * stdDev };
+}
+
+function calcADX(candles, period = 14) {
+  if (candles.length < period * 2 + 1) return null;
+  const slice = candles.slice(-(period * 2 + 1));
+  const trs = [], plusDMs = [], minusDMs = [];
+  for (let i = 1; i < slice.length; i++) {
+    const { high, low } = slice[i];
+    const { high: pH, low: pL, close: pC } = slice[i - 1];
+    trs.push(Math.max(high - low, Math.abs(high - pC), Math.abs(low - pC)));
+    const up = high - pH, down = pL - low;
+    plusDMs.push(up > down && up > 0 ? up : 0);
+    minusDMs.push(down > up && down > 0 ? down : 0);
+  }
+  let sTR = trs.slice(0, period).reduce((a, b) => a + b, 0);
+  let sPlus = plusDMs.slice(0, period).reduce((a, b) => a + b, 0);
+  let sMinus = minusDMs.slice(0, period).reduce((a, b) => a + b, 0);
+  for (let i = period; i < trs.length; i++) {
+    sTR = sTR - sTR / period + trs[i];
+    sPlus = sPlus - sPlus / period + plusDMs[i];
+    sMinus = sMinus - sMinus / period + minusDMs[i];
+  }
+  const plusDI = (sPlus / sTR) * 100;
+  const minusDI = (sMinus / sTR) * 100;
+  return Math.abs(plusDI - minusDI) / (plusDI + minusDI) * 100;
 }
 
 // VWAP — session-based, resets at midnight UTC
@@ -222,7 +613,7 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
       "RSI(3) below 30 (snap-back setup in uptrend)",
       "< 30",
       rsi3.toFixed(2),
-      rsi3 < 30,
+      rsi3 < 35,
     );
 
     // 4. Not overextended from VWAP
@@ -254,7 +645,7 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
       "RSI(3) above 70 (reversal setup in downtrend)",
       "> 70",
       rsi3.toFixed(2),
-      rsi3 > 70,
+      rsi3 > 65,
     );
 
     const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
@@ -276,6 +667,45 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
 
   const allPass = results.every((r) => r.pass);
   return { results, allPass };
+}
+
+// ─── Stock Safety Check (EMA20 + VWAP + RSI14) ──────────────────────────────
+
+function runStockSafetyCheck(price, ema20, vwap, rsi14) {
+  const { rsiOversold, rsiOverbought, vwapDistPct } = CONFIG.stockIndicators;
+  const results = [];
+
+  const check = (label, required, actual, pass) => {
+    results.push({ label, required, actual, pass });
+    console.log(`  ${pass ? "✅" : "🚫"} ${label}`);
+    console.log(`     Required: ${required} | Actual: ${actual}`);
+  };
+
+  console.log("\n── Stock Safety Check ───────────────────────────────────\n");
+
+  const bullishBias = price > vwap && price > ema20;
+  const bearishBias = price < vwap && price < ema20;
+
+  if (bullishBias) {
+    console.log("  Bias: BULLISH — checking long entry\n");
+    check("Price above VWAP", `> ${vwap.toFixed(2)}`, price.toFixed(2), price > vwap);
+    check("Price above EMA(20)", `> ${ema20.toFixed(2)}`, price.toFixed(2), price > ema20);
+    check(`RSI(14) pullback below ${rsiOversold}`, `< ${rsiOversold}`, rsi14.toFixed(2), rsi14 < rsiOversold);
+    const dist = Math.abs((price - vwap) / vwap) * 100;
+    check(`Price within ${vwapDistPct}% of VWAP`, `< ${vwapDistPct}%`, `${dist.toFixed(2)}%`, dist < vwapDistPct);
+  } else if (bearishBias) {
+    console.log("  Bias: BEARISH — checking short entry\n");
+    check("Price below VWAP", `< ${vwap.toFixed(2)}`, price.toFixed(2), price < vwap);
+    check("Price below EMA(20)", `< ${ema20.toFixed(2)}`, price.toFixed(2), price < ema20);
+    check(`RSI(14) above ${rsiOverbought}`, `> ${rsiOverbought}`, rsi14.toFixed(2), rsi14 > rsiOverbought);
+    const dist = Math.abs((price - vwap) / vwap) * 100;
+    check(`Price within ${vwapDistPct}% of VWAP`, `< ${vwapDistPct}%`, `${dist.toFixed(2)}%`, dist < vwapDistPct);
+  } else {
+    console.log("  Bias: NEUTRAL — no clear direction. No trade.\n");
+    results.push({ label: "Market bias", required: "Bullish or bearish", actual: "Neutral", pass: false });
+  }
+
+  return { results, allPass: results.every(r => r.pass) };
 }
 
 // ─── Trade Limits ────────────────────────────────────────────────────────────
@@ -313,6 +743,107 @@ function checkTradeLimits(log) {
   );
 
   return true;
+}
+
+// ─── Exit Check ─────────────────────────────────────────────────────────────
+
+async function checkExits(symbol, positions, price, ema, vwap, rsi) {
+  const open = positions.filter((p) => p.symbol === symbol);
+  const keep = [];
+  const closed = [];
+
+  for (const pos of open) {
+    // Update trailing high
+    pos.highestPrice = Math.max(pos.highestPrice || pos.entryPrice, price);
+    const trailingStop = pos.highestPrice * 0.997;
+
+    // Partial profit — take 50% at 1.0% gain once (raised from 0.5% to let trades run)
+    const gainPct = (price - pos.entryPrice) / pos.entryPrice * 100;
+    if (!pos.halfTaken && gainPct >= 1.0 && pos.side === "buy") {
+      const halfQty = pos.quantity / 2;
+      const halfPnl = (price - pos.entryPrice) * halfQty;
+      console.log(`\n  💰 PARTIAL EXIT (50%) — ${symbol} +${gainPct.toFixed(3)}% | +$${halfPnl.toFixed(2)}`);
+      if (!CONFIG.paperTrading) {
+        try { await placeBitGetOrder(symbol, "sell", pos.sizeUSD / 2, price); }
+        catch (err) { console.log(`  ❌ Partial sell failed: ${err.message}`); }
+      } else {
+        console.log(`  📋 PAPER partial exit — would sell ${halfQty.toFixed(6)} ${symbol}`);
+      }
+      recordDailyPnl(symbol, halfPnl);
+      pos.quantity = halfQty;
+      pos.sizeUSD = pos.sizeUSD / 2;
+      pos.halfTaken = true;
+    }
+
+    let exitReason = null;
+
+    if (pos.side === "buy") {
+      if (gainPct >= 2.0) {
+        exitReason = `Take-profit — +${gainPct.toFixed(3)}% reached 2.0% target`;
+      } else if (price <= trailingStop) {
+        exitReason = `Trailing stop — price $${price.toFixed(2)} hit stop $${trailingStop.toFixed(2)} (peak was $${pos.highestPrice.toFixed(2)})`;
+      } else if (rsi > 65) {
+        exitReason = `RSI ${rsi.toFixed(2)} crossed above 65 — snap-back complete`;
+      } else if (price <= vwap) {
+        exitReason = `Price $${price.toFixed(2)} touched VWAP $${vwap.toFixed(2)}`;
+      } else if (price < ema) {
+        exitReason = `Price crossed below EMA $${ema.toFixed(2)}`;
+      }
+    }
+
+    if (!exitReason) {
+      keep.push(pos);
+      continue;
+    }
+
+    const pnlPct = ((price - pos.entryPrice) / pos.entryPrice) * 100;
+    const pnlUSD = (price - pos.entryPrice) * pos.quantity;
+
+    console.log(`\n── EXIT: ${symbol} ─────────────────────────────────\n`);
+    console.log(`  Entry:  $${pos.entryPrice.toFixed(2)} @ ${pos.entryTime}`);
+    console.log(`  Peak:   $${pos.highestPrice.toFixed(2)}`);
+    console.log(`  Exit:   $${price.toFixed(2)}`);
+    console.log(`  P&L:    ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(3)}% (${pnlUSD >= 0 ? "+" : ""}$${pnlUSD.toFixed(2)})`);
+    console.log(`  Reason: ${exitReason}`);
+
+    if (!CONFIG.paperTrading) {
+      try {
+        await placeBitGetOrder(symbol, "sell", pos.sizeUSD, price);
+        console.log(`  ✅ SELL ORDER PLACED`);
+      } catch (err) {
+        console.log(`  ❌ SELL ORDER FAILED: ${err.message}`);
+        keep.push(pos);
+        continue;
+      }
+    } else {
+      console.log(`  📋 PAPER EXIT — would sell ${pos.quantity.toFixed(6)} ${symbol}`);
+    }
+
+    recordDailyPnl(symbol, pnlUSD);
+    if (pnlUSD > 0) recordWin(symbol); else recordLoss(symbol);
+    const durationMs = Date.now() - new Date(pos.entryTime).getTime();
+    const durationMin = Math.round(durationMs / 60000);
+    closed.push({ symbol, entryPrice: pos.entryPrice, exitPrice: price, pnlUSD, pnlPct, durationMin, reason: exitReason, time: new Date().toISOString() });
+
+    const now = new Date();
+    appendFileSync(CSV_FILE, [
+      now.toISOString().slice(0, 10),
+      now.toISOString().slice(11, 19),
+      "BitGet",
+      symbol,
+      "SELL",
+      pos.quantity.toFixed(6),
+      price.toFixed(2),
+      (price * pos.quantity).toFixed(2),
+      (price * pos.quantity * 0.001).toFixed(4),
+      (price * pos.quantity * 0.999).toFixed(2),
+      `EXIT-${Date.now()}`,
+      CONFIG.paperTrading ? "PAPER" : "LIVE",
+      `"${exitReason}"`,
+    ].join(",") + "\n");
+  }
+
+  return { positions: [...keep, ...positions.filter((p) => p.symbol !== symbol)], closed };
 }
 
 // ─── BitGet Execution ────────────────────────────────────────────────────────
@@ -507,19 +1038,67 @@ async function run() {
   // Load strategy
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
   console.log(`\nStrategy: ${rules.strategy.name}`);
-  console.log(`Symbol: ${CONFIG.symbol} | Timeframe: ${CONFIG.timeframe}`);
+  console.log(`Symbols: ${CONFIG.symbols.join(", ")} | Timeframe: ${CONFIG.timeframe}`);
 
   // Load log and check daily limits
   const log = loadLog();
+  let positions = loadPositions();
   const withinLimits = checkTradeLimits(log);
   if (!withinLimits) {
     console.log("\nBot stopping — trade limits reached for today.");
     return;
   }
 
-  // Fetch candle data — need enough for EMA(8) + full session for VWAP
-  console.log("\n── Fetching market data from Binance ───────────────────\n");
-  const candles = await fetchCandles(CONFIG.symbol, CONFIG.timeframe, 500);
+  // Fetch all global context in parallel
+  console.log("\n── Market Context ───────────────────────────────────────\n");
+  const [cryptoHeadlines, fearGreed, economicEvents, onChain] = await Promise.all([
+    fetchNewsHeadlines(true),
+    fetchFearGreed(),
+    fetchEconomicEvents(),
+    fetchOnChainData(),
+  ]);
+  const learned = loadLearned();
+
+  console.log(`  Fear & Greed:  ${fearGreed.value}/100 — ${fearGreed.label}`);
+  console.log(`  Economic events (next 30min): ${economicEvents.length > 0 ? economicEvents.map(e => e.title).join(", ") : "none"}`);
+  if (onChain) console.log(`  BTC Dominance: ${onChain.btcDominance.toFixed(1)}% | Market 24h: ${onChain.marketChange24h >= 0 ? "+" : ""}${onChain.marketChange24h.toFixed(2)}%`);
+  console.log(`  News headlines: ${cryptoHeadlines.length} in last 30min`);
+
+  // Block all trading during high-impact economic events
+  if (economicEvents.length > 0) {
+    console.log(`\n🚫 High-impact economic event imminent — skipping all trades this cycle.`);
+    return;
+  }
+
+  // Weekly loss limit
+  const weeklyPnl = getWeeklyPnl();
+  const weeklyLossLimit = CONFIG.portfolioValue * (parseFloat(process.env.WEEKLY_LOSS_LIMIT_PCT || "5") / 100);
+  if (weeklyPnl < -weeklyLossLimit) {
+    console.log(`\n🚫 Weekly loss limit reached: $${weeklyPnl.toFixed(2)} / -$${weeklyLossLimit.toFixed(2)} — no trading until Monday.`);
+    return;
+  }
+  console.log(`  Weekly P&L: ${weeklyPnl >= 0 ? "+" : ""}$${weeklyPnl.toFixed(2)} (limit: -$${weeklyLossLimit.toFixed(2)})`);
+
+  const CORRELATED_GROUPS = [
+    ["BTCUSDT", "ETHUSDT", "SOLUSDT", "AVAXUSDT"],
+    ["XRPUSDT", "ADAUSDT", "DOTUSDT", "LINKUSDT"],
+    ["DOGEUSDT", "GALAUSDT", "SANDUSDT", "MANAUSDT", "AXSUSDT"],
+  ];
+  const tradedThisCycle = new Set();
+
+  // Loop through all symbols
+  for (const symbol of CONFIG.symbols) {
+    console.log(`\n${"─".repeat(57)}`);
+    console.log(`  Checking ${symbol}...`);
+
+  let candles;
+  try {
+    console.log("\n── Fetching market data from OKX ──────────────────────\n");
+    candles = await fetchCandles(symbol, CONFIG.timeframe, 500);
+  } catch (err) {
+    console.log(`  ⚠️  OKX unavailable for ${symbol}: ${err.message} — skipping.`);
+    continue;
+  }
   const closes = candles.map((c) => c.close);
   const price = closes[closes.length - 1];
   console.log(`  Current price: $${price.toFixed(2)}`);
@@ -534,25 +1113,196 @@ async function run() {
   console.log(`  RSI(3):  ${rsi3 ? rsi3.toFixed(2) : "N/A"}`);
 
   if (!vwap || !rsi3) {
-    console.log("\n⚠️  Not enough data to calculate indicators. Exiting.");
-    return;
+    console.log(`\n⚠️  Not enough data for ${symbol}. Skipping.`);
+    continue;
+  }
+
+  // ATR-based position sizing (multiplier applied later after social/on-chain checks)
+  const atr = calcATR(candles, 14);
+  const riskAmount = CONFIG.portfolioValue * 0.01;
+  let tradeSize = atr
+    ? Math.min(riskAmount / (atr / price * 1.5), CONFIG.maxTradeSizeUSD)
+    : Math.min(riskAmount, CONFIG.maxTradeSizeUSD);
+
+  // Extra indicators
+  const macd = calcMACD(closes, 12, 26, 9);
+  const bb = calcBollingerBands(closes, 20, 2);
+  const adx = calcADX(candles, 14);
+
+  console.log(`  MACD:  ${macd ? `${macd.macd.toFixed(4)} / signal ${macd.signal.toFixed(4)} (hist ${macd.histogram.toFixed(4)})` : "N/A"}`);
+  console.log(`  BB:    lower $${bb ? bb.lower.toFixed(2) : "N/A"} | upper $${bb ? bb.upper.toFixed(2) : "N/A"}`);
+  console.log(`  ADX:   ${adx ? adx.toFixed(1) : "N/A"}`);
+
+  // Volatility blackout — skip if last candle spiked > 2%
+  const lastMove = Math.abs((closes[closes.length - 1] - closes[closes.length - 2]) / closes[closes.length - 2] * 100);
+  if (lastMove > 2) {
+    console.log(`  ⚠️  Volatility spike: ${lastMove.toFixed(2)}% last candle — skipping.`);
+    continue;
+  }
+
+  // ADX filter — skip if market is ranging
+  if (adx !== null && adx < 10) {
+    console.log(`  ⚠️  ADX ${adx.toFixed(1)} < 10 — market ranging — skipping.`);
+    continue;
+  }
+
+  // Correlation filter — skip if correlated symbol already traded this cycle
+  const correlatedGroup = CORRELATED_GROUPS.find(g => g.includes(symbol));
+  if (correlatedGroup && correlatedGroup.some(s => tradedThisCycle.has(s))) {
+    console.log(`  ⚠️  Correlated position already taken this cycle — skipping.`);
+    continue;
+  }
+
+  // Volume filter — use last completed candle (index -2); the last candle is in-progress on OKX
+  const avgVolume = candles.slice(-21, -1).reduce((s, c) => s + c.volume, 0) / 20;
+  const currentVolume = candles[candles.length - 2].volume;
+  console.log(`  Volume: ${currentVolume.toFixed(0)} (avg: ${avgVolume.toFixed(0)}) ${currentVolume >= avgVolume ? "✅" : "🚫 below avg"}`);
+  if (currentVolume < avgVolume * 0.8) {
+    console.log(`  ⚠️  Volume too low — skipping.`);
+    continue;
+  }
+
+  // Self-learning: skip excluded symbols
+  if (learned.excludedSymbols.includes(symbol)) {
+    console.log(`  ⚠️  ${symbol} excluded by self-learning — skipping.`);
+    continue;
+  }
+
+  // Per-symbol cooldown
+  if (isOnCooldown(symbol)) {
+    console.log(`  ⏸️  ${symbol} on cooldown (3 consecutive losses) — skipping.`);
+    continue;
+  }
+
+  // Social sentiment + order book in parallel
+  const [social, orderBookRatio] = await Promise.all([
+    fetchSocialSentiment(symbol),
+    fetchOrderBookImbalance(symbol),
+  ]);
+  console.log(`  Social: ${social.sentiment.toUpperCase()} (${social.bullishPct}% bullish on Stocktwits)`);
+  if (orderBookRatio !== null) console.log(`  Order book: ${(orderBookRatio * 100).toFixed(1)}% bid pressure ${orderBookRatio > 0.55 ? "📈" : orderBookRatio < 0.45 ? "📉" : "➖"}`);
+
+  // Check exits for any open positions on this symbol
+  const { positions: updatedPositions } = await checkExits(symbol, positions, price, ema8, vwap, rsi3);
+  positions = updatedPositions;
+  savePositions(positions);
+
+  // Skip entry if already in a position on this symbol
+  const alreadyOpen = positions.some((p) => p.symbol === symbol);
+  if (alreadyOpen) {
+    console.log(`  ⏳ Position already open for ${symbol} — holding.`);
+    continue;
+  }
+
+  // Daily loss limit
+  const todayPnl = getTodayPnl();
+  const dailyLossLimit = CONFIG.portfolioValue * (parseFloat(process.env.DAILY_LOSS_LIMIT_PCT || "2") / 100);
+  if (todayPnl < -dailyLossLimit) {
+    console.log(`🚫 Daily loss limit reached: $${todayPnl.toFixed(2)} / -$${dailyLossLimit.toFixed(2)} — stopping for today.`);
+    break;
+  }
+
+  // 15m context — informational only, no longer blocks entry
+  try {
+    const candles15m = await fetchCandles(symbol, "15m", 20);
+    const closes15m = candles15m.map(c => c.close);
+    const price15m = closes15m[closes15m.length - 1];
+    const ema8_15m = calcEMA(closes15m, 8);
+    const bias15m = price15m > ema8_15m ? "bullish" : "bearish";
+    console.log(`  15m bias: ${bias15m.toUpperCase()} (info only)`);
+  } catch {}
+
+  // Fear & Greed filter
+  const bias1m = price > vwap && price > ema8 ? "bullish" : "bearish";
+  if (fearGreed.value < 20 && bias1m === "bullish") {
+    console.log(`  🚫 Extreme Fear (${fearGreed.value}) — skipping long entry.`);
+    continue;
+  }
+  if (fearGreed.value > 80 && bias1m === "bearish") {
+    console.log(`  🚫 Extreme Greed (${fearGreed.value}) — skipping short entry.`);
+    continue;
+  }
+
+  // On-chain: if market dropped >5% in 24h, halve position size on longs
+  let positionMultiplier = learned.positionMultipliers[symbol] || 1;
+  if (onChain && onChain.marketChange24h < -5 && bias1m === "bullish") {
+    console.log(`  ⚠️  Market down ${Math.abs(onChain.marketChange24h).toFixed(1)}% in 24h — reducing position size.`);
+    positionMultiplier *= 0.5;
+  }
+
+  // Social sentiment warning
+  if (social.sentiment === "bearish" && bias1m === "bullish") {
+    console.log(`  ⚠️  Social bearish vs bullish setup — reducing position size.`);
+    positionMultiplier *= 0.7;
+  }
+
+  // Order book: strong ask pressure against our direction = reduce size
+  if (orderBookRatio !== null) {
+    if (bias1m === "bullish" && orderBookRatio < 0.4) {
+      console.log(`  ⚠️  Heavy ask pressure (${(orderBookRatio * 100).toFixed(1)}% bids) — reducing position size.`);
+      positionMultiplier *= 0.7;
+    } else if (bias1m === "bullish" && orderBookRatio > 0.6) {
+      console.log(`  ✅ Strong bid pressure — boosting position size.`);
+      positionMultiplier *= 1.2;
+    }
+  }
+
+  // BTC dominance shift: rising dominance = altcoins bleed
+  if (onChain && onChain.btcDominance > 55 && !symbol.startsWith("BTC")) {
+    console.log(`  ⚠️  BTC dominance ${onChain.btcDominance.toFixed(1)}% — altcoin headwind. Reducing size.`);
+    positionMultiplier *= 0.8;
+  }
+
+  // News sentiment check
+  const news = await analyzeNewsSentiment(symbol, cryptoHeadlines);
+  const newsIcon = news.sentiment === "positive" ? "📈" : news.sentiment === "negative" ? "📉" : "➖";
+  console.log(`\n── News Sentiment ───────────────────────────────────────\n`);
+  console.log(`  ${newsIcon} ${news.sentiment.toUpperCase()} (${news.confidence} confidence)`);
+  if (news.reason) console.log(`  ${news.reason}`);
+
+  // Block on negative high-confidence news
+  if (news.sentiment === "negative" && news.confidence === "high") {
+    console.log(`  🚫 Negative news — skipping trade.`);
+    continue;
   }
 
   // Run safety check
-  const { results, allPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
+  const { results: safetyResults, allPass: safetyPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
 
-  // Calculate position size
-  const tradeSize = Math.min(
-    CONFIG.portfolioValue * 0.01,
-    CONFIG.maxTradeSizeUSD,
-  );
+  // MACD + Bollinger Band confirmations
+  const extraChecks = [];
+  if (macd) {
+    const bullish = price > vwap && price > ema8;
+    const macdOk = bullish ? macd.histogram > 0 : macd.histogram < 0;
+    extraChecks.push({ label: `MACD histogram ${bullish ? "positive" : "negative"} (momentum confirmed)`, pass: macdOk, required: bullish ? "> 0" : "< 0", actual: macd.histogram.toFixed(6) });
+  }
+  if (bb) {
+    const bullish = price > vwap && price > ema8;
+    console.log(`  BB:    price ${bullish ? (price <= bb.lower * 1.02 ? "near lower ✅" : "not near lower") : (price >= bb.upper * 0.98 ? "near upper ✅" : "not near upper")} | lower $${bb.lower.toFixed(2)} upper $${bb.upper.toFixed(2)}`);
+  }
+  extraChecks.forEach(c => {
+    console.log(`  ${c.pass ? "✅" : "🚫"} ${c.label}`);
+    console.log(`     Required: ${c.required} | Actual: ${c.actual}`);
+  });
+
+  const results = [...safetyResults, ...extraChecks];
+  const extraPass = extraChecks.every(c => c.pass);
+  // Strong positive news can override failed indicator conditions
+  const newsOverride = news.sentiment === "positive" && news.confidence === "high";
+  const allPass = (safetyPass && extraPass) || newsOverride;
+  if (newsOverride && !(safetyPass && extraPass)) {
+    console.log(`  📈 News override — entering on strong positive sentiment.`);
+  }
+
+  // Apply position multiplier from self-learning + market context
+  tradeSize = Math.max(10, Math.min(tradeSize * positionMultiplier, CONFIG.maxTradeSizeUSD));
 
   // Decision
   console.log("\n── Decision ─────────────────────────────────────────────\n");
 
   const logEntry = {
     timestamp: new Date().toISOString(),
-    symbol: CONFIG.symbol,
+    symbol: symbol,
     timeframe: CONFIG.timeframe,
     price,
     indicators: { ema8, vwap, rsi3 },
@@ -577,20 +1327,26 @@ async function run() {
   } else {
     console.log(`✅ ALL CONDITIONS MET`);
 
+    // Switch TradingView to this symbol so you can watch the trade live
+    await switchTradingViewChart(symbol);
+
     if (CONFIG.paperTrading) {
       console.log(
-        `\n📋 PAPER TRADE — would buy ${CONFIG.symbol} ~$${tradeSize.toFixed(2)} at market`,
+        `\n📋 PAPER TRADE — would buy ${symbol} ~$${tradeSize.toFixed(2)} at market`,
       );
       console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
       logEntry.orderPlaced = true;
       logEntry.orderId = `PAPER-${Date.now()}`;
+      positions.push({ symbol, side: "buy", entryPrice: price, highestPrice: price, entryTime: new Date().toISOString(), sizeUSD: tradeSize, quantity: tradeSize / price });
+      savePositions(positions);
+      tradedThisCycle.add(symbol);
     } else {
       console.log(
-        `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} BUY ${CONFIG.symbol}`,
+        `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} BUY ${symbol}`,
       );
       try {
         const order = await placeBitGetOrder(
-          CONFIG.symbol,
+          symbol,
           "buy",
           tradeSize,
           price,
@@ -598,6 +1354,9 @@ async function run() {
         logEntry.orderPlaced = true;
         logEntry.orderId = order.orderId;
         console.log(`✅ ORDER PLACED — ${order.orderId}`);
+        positions.push({ symbol, side: "buy", entryPrice: price, highestPrice: price, entryTime: new Date().toISOString(), sizeUSD: tradeSize, quantity: tradeSize / price });
+        savePositions(positions);
+        tradedThisCycle.add(symbol);
       } catch (err) {
         console.log(`❌ ORDER FAILED — ${err.message}`);
         logEntry.error = err.message;
@@ -612,6 +1371,171 @@ async function run() {
 
   // Write tax CSV row for every run (executed, paper, or blocked)
   writeTradeCsv(logEntry);
+
+  } // end crypto symbol loop
+
+  // ── Stocks loop ────────────────────────────────────────────────────────────
+  if (CONFIG.stocks.length > 0) {
+    console.log(`\n${"═".repeat(57)}`);
+    console.log(`  STOCKS — ${CONFIG.stocks.join(", ")}`);
+    console.log(`${"═".repeat(57)}`);
+
+    for (const ticker of CONFIG.stocks) {
+      const withinLimitsNow = checkTradeLimits(log);
+      if (!withinLimitsNow) { console.log("\nTrade limit reached — stopping stocks loop."); break; }
+
+      console.log(`\n${"─".repeat(57)}`);
+      console.log(`  Checking ${ticker}...`);
+
+      // Stock market hours: 9:30am–4pm EST = 13:30–20:00 UTC
+      const nowUtc = new Date();
+      const utcMinutes = nowUtc.getUTCHours() * 60 + nowUtc.getUTCMinutes();
+      if (utcMinutes < 13 * 60 + 30 || utcMinutes >= 20 * 60) {
+        console.log(`  ⏰ Market closed — skipping ${ticker} (trades 13:30–20:00 UTC)`);
+        continue;
+      }
+
+      let candles;
+      try {
+        candles = await fetchStockCandles(ticker, 500);
+      } catch (err) {
+        console.log(`  ⚠️  Skipping ${ticker}: ${err.message}`);
+        continue;
+      }
+      if (candles.length < 20) { console.log(`  ⚠️  Not enough data for ${ticker}. Skipping.`); continue; }
+
+      const closes = candles.map(c => c.close);
+      const price = closes[closes.length - 1];
+      const ema20 = calcEMA(closes, CONFIG.stockIndicators.emaPeriod);
+      const vwap = calcVWAP(candles);
+      const rsi14 = calcRSI(closes, CONFIG.stockIndicators.rsiPeriod);
+
+      console.log(`  Current price: $${price.toFixed(2)}`);
+      console.log(`  EMA(20): $${ema20.toFixed(2)}`);
+      console.log(`  VWAP:    $${vwap ? vwap.toFixed(2) : "N/A"}`);
+      console.log(`  RSI(14): ${rsi14 ? rsi14.toFixed(2) : "N/A"}`);
+
+      if (!vwap || !rsi14) { console.log(`  ⚠️  Skipping ${ticker} — insufficient indicator data.`); continue; }
+
+      // Check exits for open stock positions
+      const { positions: updatedStockPositions } = await checkExits(ticker, positions, price, ema20, vwap, rsi14);
+      positions = updatedStockPositions;
+      savePositions(positions);
+
+      // Skip entry if already in a position on this ticker
+      const stockAlreadyOpen = positions.some((p) => p.symbol === ticker);
+      if (stockAlreadyOpen) {
+        console.log(`  ⏳ Position already open for ${ticker} — holding.`);
+        continue;
+      }
+
+      const { results, allPass } = runStockSafetyCheck(price, ema20, vwap, rsi14);
+      const tradeSize = Math.min(CONFIG.portfolioValue * 0.01, CONFIG.maxTradeSizeUSD);
+
+      const logEntry = {
+        timestamp: new Date().toISOString(),
+        symbol: ticker,
+        assetType: "stock",
+        timeframe: "1m",
+        price,
+        indicators: { ema20, vwap, rsi14 },
+        conditions: results,
+        allPass,
+        tradeSize,
+        orderPlaced: false,
+        orderId: null,
+        paperTrading: true,
+        limits: { maxTradeSizeUSD: CONFIG.maxTradeSizeUSD, maxTradesPerDay: CONFIG.maxTradesPerDay, tradesToday: countTodaysTrades(log) },
+      };
+
+      console.log("\n── Decision ─────────────────────────────────────────────\n");
+      if (!allPass) {
+        const failed = results.filter(r => !r.pass).map(r => r.label);
+        console.log(`🚫 TRADE BLOCKED`);
+        failed.forEach(f => console.log(`   - ${f}`));
+      } else {
+        console.log(`✅ ALL CONDITIONS MET`);
+        await switchTradingViewChart(`${ticker}USD`);
+        logEntry.orderPlaced = true;
+        if (process.env.ALPACA_API_KEY) {
+          try {
+            const alpacaQty = tradeSize / price;
+            const order = await placeAlpacaOrder(ticker, "buy", alpacaQty);
+            logEntry.orderId = order.id;
+            logEntry.paperTrading = false;
+            console.log(`\n📈 ALPACA ORDER PLACED — ${ticker} qty ${alpacaQty.toFixed(4)} | id ${order.id}`);
+          } catch (err) {
+            console.log(`  ❌ Alpaca order failed: ${err.message}`);
+            logEntry.orderId = `PAPER-STOCK-${Date.now()}`;
+            console.log(`\n📋 PAPER TRADE — would buy ${ticker} ~$${tradeSize.toFixed(2)} at market`);
+          }
+        } else {
+          logEntry.orderId = `PAPER-STOCK-${Date.now()}`;
+          console.log(`\n📋 PAPER TRADE — would buy ${ticker} ~$${tradeSize.toFixed(2)} at market`);
+        }
+        positions.push({ symbol: ticker, side: "buy", entryPrice: price, highestPrice: price, entryTime: new Date().toISOString(), sizeUSD: tradeSize, quantity: tradeSize / price });
+        savePositions(positions);
+      }
+
+      log.trades.push(logEntry);
+      saveLog(log);
+    }
+  }
+
+  // Export trades + full analytics for the live dashboard
+  const dailyPnlData = loadDailyPnl();
+  const dailyTotals = Object.values(dailyPnlData).map(d => d.total || 0);
+
+  // Max drawdown
+  let peak = 0, running = 0, maxDrawdown = 0;
+  for (const r of dailyTotals) {
+    running += r;
+    if (running > peak) peak = running;
+    const dd = peak - running;
+    if (dd > maxDrawdown) maxDrawdown = dd;
+  }
+
+  // Sharpe ratio (annualised, 0 risk-free rate)
+  let sharpe = null;
+  if (dailyTotals.length >= 2) {
+    const mean = dailyTotals.reduce((a, b) => a + b, 0) / dailyTotals.length;
+    const stdDev = Math.sqrt(dailyTotals.reduce((sum, r) => sum + Math.pow(r - mean, 2), 0) / dailyTotals.length);
+    if (stdDev > 0) sharpe = ((mean / stdDev) * Math.sqrt(252)).toFixed(2);
+  }
+
+  // Per-symbol aggregated stats
+  const bySymbol = {};
+  Object.values(dailyPnlData).forEach(day => {
+    Object.entries(day.bySymbol || {}).forEach(([sym, s]) => {
+      if (!bySymbol[sym]) bySymbol[sym] = { pnl: 0, trades: 0, wins: 0 };
+      bySymbol[sym].pnl += s.pnl;
+      bySymbol[sym].trades += s.trades;
+      bySymbol[sym].wins += s.wins;
+    });
+  });
+
+  // Per-hour aggregated stats
+  const byHour = {};
+  Object.values(dailyPnlData).forEach(day => {
+    Object.entries(day.byHour || {}).forEach(([hr, h]) => {
+      if (!byHour[hr]) byHour[hr] = { pnl: 0, trades: 0 };
+      byHour[hr].pnl += h.pnl;
+      byHour[hr].trades += h.trades;
+    });
+  });
+
+  writeFileSync("trades-data.json", JSON.stringify({
+    trades: log.trades,
+    openPositions: positions,
+    stats: {
+      todayPnl: getTodayPnl(),
+      maxDrawdown,
+      sharpe,
+      bySymbol,
+      byHour,
+      dailyPnl: dailyPnlData,
+    },
+  }, null, 2));
 
   console.log("═══════════════════════════════════════════════════════════\n");
 }
