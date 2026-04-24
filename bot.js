@@ -1295,15 +1295,28 @@ async function run() {
     continue;
   }
 
-  // Momentum candle — last completed candle must show buying reversal, not still falling
+  // 1m bias — calculated once, used for all timeframe alignment + downstream checks
+  const bias1m = price > vwap && price > ema8 ? "bullish" : "bearish";
+  const tradeSide = bias1m === "bullish" ? "buy" : "sell";
+
+  // Momentum candle — last completed candle must show reversal in our direction
   const lastCandle = candles[candles.length - 2];
   const prevCandle = candles[candles.length - 3];
   if (symbol.endsWith("USDT")) {
-    const bullishReversal = lastCandle.close > lastCandle.open;
-    const sellingExhaustion = prevCandle && lastCandle.low < prevCandle.low && lastCandle.close > prevCandle.close;
-    if (!bullishReversal && !sellingExhaustion) {
-      console.log(`  ⚠️  No reversal candle — still bearish. Waiting for buyers.`);
-      continue;
+    if (tradeSide === "buy") {
+      const bullishReversal = lastCandle.close > lastCandle.open;
+      const sellingExhaustion = prevCandle && lastCandle.low < prevCandle.low && lastCandle.close > prevCandle.close;
+      if (!bullishReversal && !sellingExhaustion) {
+        console.log(`  ⚠️  No bullish reversal candle — still falling. Waiting for buyers.`);
+        continue;
+      }
+    } else {
+      const bearishReversal = lastCandle.close < lastCandle.open;
+      const buyingExhaustion = prevCandle && lastCandle.high > prevCandle.high && lastCandle.close < prevCandle.close;
+      if (!bearishReversal && !buyingExhaustion) {
+        console.log(`  ⚠️  No bearish reversal candle — still rising. Waiting for sellers.`);
+        continue;
+      }
     }
   }
 
@@ -1314,10 +1327,6 @@ async function run() {
     console.log(`🚫 Daily loss limit reached: $${todayPnl.toFixed(2)} / -$${dailyLossLimit.toFixed(2)} — stopping for today.`);
     break;
   }
-
-  // 1m bias — calculated once, used for all timeframe alignment + downstream checks
-  const bias1m = price > vwap && price > ema8 ? "bullish" : "bearish";
-  const tradeSide = bias1m === "bullish" ? "buy" : "sell";
 
   // 15m bias — required to align with 1m direction (no counter-trend entries)
   try {
@@ -1367,19 +1376,28 @@ async function run() {
     positionMultiplier *= 0.5;
   }
 
-  // Social sentiment warning
-  if (social.sentiment === "bearish" && bias1m === "bullish") {
-    console.log(`  ⚠️  Social bearish vs bullish setup — reducing position size.`);
+  // Social sentiment — opposing social signal reduces size for either direction
+  if (social.sentiment === "bearish" && tradeSide === "buy") {
+    console.log(`  ⚠️  Social bearish vs long setup — reducing position size.`);
+    positionMultiplier *= 0.7;
+  } else if (social.sentiment === "bullish" && tradeSide === "sell") {
+    console.log(`  ⚠️  Social bullish vs short setup — reducing position size.`);
     positionMultiplier *= 0.7;
   }
 
-  // Order book: strong ask pressure against our direction = reduce size
+  // Order book: pressure against our direction = reduce, with us = boost
   if (orderBookRatio !== null) {
-    if (bias1m === "bullish" && orderBookRatio < 0.4) {
-      console.log(`  ⚠️  Heavy ask pressure (${(orderBookRatio * 100).toFixed(1)}% bids) — reducing position size.`);
+    if (tradeSide === "buy" && orderBookRatio < 0.4) {
+      console.log(`  ⚠️  Heavy ask pressure (${(orderBookRatio * 100).toFixed(1)}% bids) — reducing long size.`);
       positionMultiplier *= 0.7;
-    } else if (bias1m === "bullish" && orderBookRatio > 0.6) {
-      console.log(`  ✅ Strong bid pressure — boosting position size.`);
+    } else if (tradeSide === "buy" && orderBookRatio > 0.6) {
+      console.log(`  ✅ Strong bid pressure — boosting long size.`);
+      positionMultiplier *= 1.2;
+    } else if (tradeSide === "sell" && orderBookRatio > 0.6) {
+      console.log(`  ⚠️  Heavy bid pressure (${(orderBookRatio * 100).toFixed(1)}% bids) — reducing short size.`);
+      positionMultiplier *= 0.7;
+    } else if (tradeSide === "sell" && orderBookRatio < 0.4) {
+      console.log(`  ✅ Strong ask pressure — boosting short size.`);
       positionMultiplier *= 1.2;
     }
   }
@@ -1397,9 +1415,13 @@ async function run() {
   console.log(`  ${newsIcon} ${news.sentiment.toUpperCase()} (${news.confidence} confidence)`);
   if (news.reason) console.log(`  ${news.reason}`);
 
-  // Block on negative high-confidence news
-  if (news.sentiment === "negative" && news.confidence === "high") {
-    console.log(`  🚫 Negative news — skipping trade.`);
+  // Block on news that opposes our direction
+  if (tradeSide === "buy" && news.sentiment === "negative" && news.confidence === "high") {
+    console.log(`  🚫 Negative news — skipping long entry.`);
+    continue;
+  }
+  if (tradeSide === "sell" && news.sentiment === "positive" && news.confidence === "high") {
+    console.log(`  🚫 Positive news — skipping short entry.`);
     continue;
   }
 
@@ -1424,8 +1446,10 @@ async function run() {
 
   const results = [...safetyResults, ...extraChecks];
   const extraPass = extraChecks.every(c => c.pass);
-  // Strong positive news can override failed indicator conditions
-  const newsOverride = news.sentiment === "positive" && news.confidence === "high";
+  // Strong news aligned with our direction can override failed indicator conditions
+  const newsOverride = tradeSide === "buy"
+    ? (news.sentiment === "positive" && news.confidence === "high")
+    : (news.sentiment === "negative" && news.confidence === "high");
   const allPass = (safetyPass && extraPass) || newsOverride;
   if (newsOverride && !(safetyPass && extraPass)) {
     console.log(`  📈 News override — entering on strong positive sentiment.`);
