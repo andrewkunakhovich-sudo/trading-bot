@@ -2,3 +2,13 @@
 *.log
 safety-check-log.json
 node_modules/
+trades.csv
+trades-data.json
+positions.json
+cooldowns.json
+morning-report.json
+learned-adjustments.json
+daily-pnl.json
+ngrok-err.txt
+ngrok-out.txt
+transcripts_raw.txt
