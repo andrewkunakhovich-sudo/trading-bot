@@ -26,8 +26,11 @@
   tr:hover td { background: #1f2235; }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
   .badge.paper { background: #1e3a5f; color: #60a5fa; }
+  .badge.paper-short { background: #3a1e2a; color: #f472b6; }
   .badge.paper-stock { background: #1a3a2a; color: #34d399; }
   .badge.blocked { background: #2d1f1f; color: #6b7280; }
+  .badge.long { background: #1a3a2a; color: #34d399; }
+  .badge.short { background: #3a1e2a; color: #f472b6; }
   .up { color: #10b981; font-weight: 600; }
   .down { color: #ef4444; font-weight: 600; }
   .neutral { color: #6b7280; }
@@ -46,6 +49,7 @@
 <div id="equity" class="section"></div>
 <div id="crypto-positions" class="section"></div>
 <div id="stock-positions" class="section"></div>
+<div id="closed-trades" class="section"></div>
 <div id="perf-symbol" class="section"></div>
 <div id="perf-hour" class="section"></div>
 <div id="ai-insights" class="section"></div>
@@ -221,14 +225,23 @@ async function load() {
 
     // Open positions table
     function posRow(pos, icon, label) {
+      const isShort = pos.side === "sell";
       const currentPrice = priceMap[pos.symbol];
-      const pnl = currentPrice ? (currentPrice - pos.entryPrice) * pos.quantity : null;
+      const pnl = currentPrice
+        ? (isShort ? (pos.entryPrice - currentPrice) : (currentPrice - pos.entryPrice)) * pos.quantity
+        : null;
       const pnlPct = pnl !== null ? (pnl / pos.sizeUSD * 100) : null;
       const pnlClass = pnl === null ? 'neutral' : pnl >= 0 ? 'up' : 'down';
       const pnlStr = pnl === null ? '—' : `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${pnl >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%)`;
-      const trailStop = pos.highestPrice ? (pos.highestPrice * 0.997).toFixed(2) : '—';
+      const trailLevel = isShort ? pos.lowestPrice : pos.highestPrice;
+      const trailStop = trailLevel
+        ? (isShort ? (trailLevel * 1.003).toFixed(2) : (trailLevel * 0.997).toFixed(2))
+        : '—';
+      const dirBadge = isShort
+        ? `<span class="badge short">SHORT</span>`
+        : `<span class="badge long">LONG</span>`;
       return `<tr>
-        <td><span class="coin-icon">${icon}</span><strong>${label}</strong></td>
+        <td><span class="coin-icon">${icon}</span><strong>${label}</strong> ${dirBadge}</td>
         <td>$${pos.entryPrice.toFixed(4)}</td>
         <td>${currentPrice ? '$' + currentPrice.toFixed(4) : '—'}</td>
         <td>$${pos.sizeUSD.toFixed(2)}</td>
@@ -252,6 +265,35 @@ async function load() {
         <thead><tr><th>Ticker</th><th>Entry</th><th>Current Price</th><th>Size</th><th>P&L</th><th>Trail Stop</th></tr></thead>
         <tbody>${stockRows || '<tr><td colspan="6" style="color:#6b7280;text-align:center">No open stock positions</td></tr>'}</tbody>
       </table>`;
+
+    // Closed trades
+    const closedTrades = (raw.closedTrades || []).slice().reverse();
+    if (closedTrades.length > 0) {
+      const closedRows = closedTrades.slice(0, 20).map(t => {
+        const isShort = t.side === "short";
+        const dirBadge = isShort
+          ? `<span class="badge short">SHORT</span>`
+          : `<span class="badge long">LONG</span>`;
+        const pnlClass = t.pnlUSD >= 0 ? 'up' : 'down';
+        return `<tr>
+          <td style="color:#6b7280">${t.time?.slice(0,16).replace('T',' ') || '—'}</td>
+          <td><strong>${t.symbol?.replace('USDT','') || '—'}</strong> ${dirBadge}</td>
+          <td>$${t.entryPrice?.toFixed(2) || '—'}</td>
+          <td>$${t.exitPrice?.toFixed(2) || '—'}</td>
+          <td class="${pnlClass}">${t.pnlUSD >= 0 ? '+' : ''}$${t.pnlUSD?.toFixed(2) || '—'} (${t.pnlPct >= 0 ? '+' : ''}${t.pnlPct?.toFixed(2) || '—'}%)</td>
+          <td style="color:#6b7280">${t.durationMin || '—'}m</td>
+          <td style="color:#6b7280;font-size:11px">${t.reason || '—'}</td>
+        </tr>`;
+      }).join('');
+      document.getElementById('closed-trades').innerHTML = `
+        <div class="section-title">Recent Exits</div>
+        <table>
+          <thead><tr><th>Time (UTC)</th><th>Symbol</th><th>Entry</th><th>Exit</th><th>P&L</th><th>Duration</th><th>Reason</th></tr></thead>
+          <tbody>${closedRows}</tbody>
+        </table>`;
+    } else {
+      document.getElementById('closed-trades').innerHTML = '';
+    }
 
     // Performance by symbol
     const symEntries = Object.entries(bySymbol).sort((a, b) => b[1].pnl - a[1].pnl);
@@ -320,8 +362,9 @@ async function load() {
       const isStock = t.assetType === 'stock' || (!isCrypto(t.symbol) && t.symbol.length <= 5);
       const icon = isStock ? stockIcon(t.symbol) : coinIcon(t.symbol);
       const label = isStock ? t.symbol : (t.symbol?.replace('USDT','') || '—');
-      const badgeClass = !t.orderPlaced ? 'blocked' : isStock ? 'paper-stock' : 'paper';
-      const badgeText = !t.orderPlaced ? 'BLOCKED' : isStock ? 'PAPER STOCK' : 'PAPER BUY';
+      const isShortEntry = t.side === "sell";
+      const badgeClass = !t.orderPlaced ? 'blocked' : isStock ? 'paper-stock' : isShortEntry ? 'paper-short' : 'paper';
+      const badgeText = !t.orderPlaced ? 'BLOCKED' : isStock ? 'PAPER STOCK' : isShortEntry ? 'PAPER SHORT' : 'PAPER LONG';
       return `<tr>
         <td style="color:#6b7280">${t.timestamp?.slice(0,19).replace('T',' ') || '—'}</td>
         <td><span class="coin-icon">${icon}</span><strong>${label}</strong></td>

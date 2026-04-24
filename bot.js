@@ -15,6 +15,30 @@ import crypto from "crypto";
 import { execSync } from "child_process";
 import WebSocket from "ws";
 
+// ─── Alerts (Telegram / Discord) ─────────────────────────────────────────────
+
+async function sendAlert(msg) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  const webhook = process.env.DISCORD_WEBHOOK_URL;
+  if (token && chatId) {
+    try {
+      await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, text: msg }),
+      });
+    } catch {}
+  }
+  if (webhook) {
+    try {
+      await fetch(webhook, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: msg }),
+      });
+    } catch {}
+  }
+}
+
 // ─── News Sentiment ──────────────────────────────────────────────────────────
 
 const NEWS_FEEDS = {
@@ -347,6 +371,18 @@ const CONFIG = {
 const LOG_FILE = "safety-check-log.json";
 const POSITIONS_FILE = "positions.json";
 const DAILY_PNL_FILE = "daily-pnl.json";
+const CLOSED_TRADES_FILE = "closed-trades.json";
+
+function loadClosedTrades() {
+  if (!existsSync(CLOSED_TRADES_FILE)) return [];
+  try { return JSON.parse(readFileSync(CLOSED_TRADES_FILE, "utf8")); } catch { return []; }
+}
+
+function appendClosedTrade(trade) {
+  const trades = loadClosedTrades();
+  trades.push(trade);
+  writeFileSync(CLOSED_TRADES_FILE, JSON.stringify(trades.slice(-200), null, 2));
+}
 
 function loadDailyPnl() {
   if (!existsSync(DAILY_PNL_FILE)) return {};
@@ -762,59 +798,63 @@ async function checkExits(symbol, positions, price, ema, vwap, rsi) {
   const closed = [];
 
   for (const pos of open) {
-    // Update trailing high
-    pos.highestPrice = Math.max(pos.highestPrice || pos.entryPrice, price);
-    // After partial exit, tighten trail to 0.15% to lock in remaining profit
-    const trailingStop = pos.halfTaken
-      ? pos.highestPrice * 0.9985
-      : pos.highestPrice * 0.997;
+    const isLong = pos.side !== "sell";
 
-    const gainPct = (price - pos.entryPrice) / pos.entryPrice * 100;
+    if (isLong) pos.highestPrice = Math.max(pos.highestPrice || pos.entryPrice, price);
+    else pos.lowestPrice = Math.min(pos.lowestPrice || pos.entryPrice, price);
 
-    // Breakeven stop — once +0.5% up, the trade can never lose
-    if (!pos.breakevenSet && gainPct >= 0.5 && pos.side === "buy") {
+    const gainPct = isLong
+      ? (price - pos.entryPrice) / pos.entryPrice * 100
+      : (pos.entryPrice - price) / pos.entryPrice * 100;
+
+    const trailLevel = isLong ? pos.highestPrice : pos.lowestPrice;
+    const trailingStop = isLong
+      ? (pos.halfTaken ? trailLevel * 0.9985 : trailLevel * 0.997)
+      : (pos.halfTaken ? trailLevel * 1.0015 : trailLevel * 1.003);
+
+    // Breakeven stop — once +0.5% in profit, stop moves to entry
+    if (!pos.breakevenSet && gainPct >= 0.5) {
       pos.breakevenSet = true;
       pos.stopPrice = pos.entryPrice;
       console.log(`  🔒 Breakeven stop set at $${pos.entryPrice.toFixed(2)}`);
     }
 
-    // Partial profit — take 50% at 1.0% gain once
-    if (!pos.halfTaken && gainPct >= 1.0 && pos.side === "buy") {
+    // Partial profit at +1.0% — take 50% off the table
+    if (!pos.halfTaken && gainPct >= 1.0) {
       const halfQty = pos.quantity / 2;
-      const halfPnl = (price - pos.entryPrice) * halfQty;
-      console.log(`\n  💰 PARTIAL EXIT (50%) — ${symbol} +${gainPct.toFixed(3)}% | +$${halfPnl.toFixed(2)}`);
+      const halfPnlUSD = isLong
+        ? (price - pos.entryPrice) * halfQty
+        : (pos.entryPrice - price) * halfQty;
+      console.log(`\n  💰 PARTIAL EXIT (50%) — ${symbol} (${isLong ? "LONG" : "SHORT"}) +${gainPct.toFixed(3)}% | +$${halfPnlUSD.toFixed(2)}`);
+      const coverSide = isLong ? "sell" : "buy";
       if (!CONFIG.paperTrading) {
-        try { await placeBitGetOrder(symbol, "sell", pos.sizeUSD / 2, price); }
-        catch (err) { console.log(`  ❌ Partial sell failed: ${err.message}`); }
+        try { await placeBitGetOrder(symbol, coverSide, pos.sizeUSD / 2, price); }
+        catch (err) { console.log(`  ❌ Partial exit failed: ${err.message}`); }
       } else {
-        console.log(`  📋 PAPER partial exit — would sell ${halfQty.toFixed(6)} ${symbol}`);
+        console.log(`  📋 PAPER partial exit — would ${coverSide} ${halfQty.toFixed(6)} ${symbol}`);
       }
-      recordDailyPnl(symbol, halfPnl);
+      recordDailyPnl(symbol, halfPnlUSD);
       pos.quantity = halfQty;
-      pos.sizeUSD = pos.sizeUSD / 2;
+      pos.sizeUSD /= 2;
       pos.halfTaken = true;
     }
 
     let exitReason = null;
 
-    if (pos.side === "buy") {
-      // Hard stop-loss — max -1.0% from entry, no exceptions
-      if (gainPct <= -1.0) {
-        exitReason = `Hard stop-loss — -${Math.abs(gainPct).toFixed(3)}% exceeded -1.0% limit`;
-      // Breakeven stop — exit if price falls back to entry after being up 0.5%
-      } else if (pos.breakevenSet && price < pos.stopPrice) {
-        exitReason = `Breakeven stop — price $${price.toFixed(2)} fell back to entry $${pos.entryPrice.toFixed(2)}`;
-      } else if (gainPct >= 3.0) {
-        exitReason = `Take-profit — +${gainPct.toFixed(3)}% reached 3.0% target`;
-      } else if (price <= trailingStop) {
-        exitReason = `Trailing stop — price $${price.toFixed(2)} hit stop $${trailingStop.toFixed(2)} (peak was $${pos.highestPrice.toFixed(2)})`;
-      } else if (rsi > 65) {
-        exitReason = `RSI ${rsi.toFixed(2)} crossed above 65 — snap-back complete`;
-      } else if (price <= vwap) {
-        exitReason = `Price $${price.toFixed(2)} touched VWAP $${vwap.toFixed(2)}`;
-      } else if (price < ema) {
-        exitReason = `Price crossed below EMA $${ema.toFixed(2)}`;
-      }
+    if (gainPct <= -1.0) {
+      exitReason = `Hard stop-loss — ${Math.abs(gainPct).toFixed(3)}% exceeded 1.0% limit`;
+    } else if (pos.breakevenSet && (isLong ? price < pos.stopPrice : price > pos.stopPrice)) {
+      exitReason = `Breakeven stop — price $${price.toFixed(2)} returned to entry $${pos.entryPrice.toFixed(2)}`;
+    } else if (gainPct >= 3.0) {
+      exitReason = `Take-profit — +${gainPct.toFixed(3)}% reached 3.0% target`;
+    } else if (isLong ? price <= trailingStop : price >= trailingStop) {
+      exitReason = `Trailing stop — price $${price.toFixed(2)} hit stop $${trailingStop.toFixed(2)} (${isLong ? "peak" : "low"} $${trailLevel.toFixed(2)})`;
+    } else if (isLong ? rsi > 65 : rsi < 35) {
+      exitReason = `RSI ${rsi.toFixed(2)} exit — snap-back complete`;
+    } else if (isLong ? price <= vwap : price >= vwap) {
+      exitReason = `Price $${price.toFixed(2)} touched VWAP $${vwap.toFixed(2)}`;
+    } else if (isLong ? price < ema : price > ema) {
+      exitReason = `Price ${isLong ? "crossed below" : "crossed above"} EMA $${ema.toFixed(2)}`;
     }
 
     if (!exitReason) {
@@ -822,34 +862,54 @@ async function checkExits(symbol, positions, price, ema, vwap, rsi) {
       continue;
     }
 
-    const pnlPct = ((price - pos.entryPrice) / pos.entryPrice) * 100;
-    const pnlUSD = (price - pos.entryPrice) * pos.quantity;
+    const pnlUSD = isLong
+      ? (price - pos.entryPrice) * pos.quantity
+      : (pos.entryPrice - price) * pos.quantity;
+    const pnlPct = isLong
+      ? ((price - pos.entryPrice) / pos.entryPrice) * 100
+      : ((pos.entryPrice - price) / pos.entryPrice) * 100;
 
-    console.log(`\n── EXIT: ${symbol} ─────────────────────────────────\n`);
+    console.log(`\n── EXIT: ${symbol} (${isLong ? "LONG" : "SHORT"}) ────────────────────────────────\n`);
     console.log(`  Entry:  $${pos.entryPrice.toFixed(2)} @ ${pos.entryTime}`);
-    console.log(`  Peak:   $${pos.highestPrice.toFixed(2)}`);
+    console.log(`  ${isLong ? "Peak" : "Low"}:   $${trailLevel.toFixed(2)}`);
     console.log(`  Exit:   $${price.toFixed(2)}`);
     console.log(`  P&L:    ${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(3)}% (${pnlUSD >= 0 ? "+" : ""}$${pnlUSD.toFixed(2)})`);
     console.log(`  Reason: ${exitReason}`);
 
+    const exitSide = isLong ? "sell" : "buy";
     if (!CONFIG.paperTrading) {
       try {
-        await placeBitGetOrder(symbol, "sell", pos.sizeUSD, price);
-        console.log(`  ✅ SELL ORDER PLACED`);
+        await placeBitGetOrder(symbol, exitSide, pos.sizeUSD, price);
+        console.log(`  ✅ EXIT ORDER PLACED`);
       } catch (err) {
-        console.log(`  ❌ SELL ORDER FAILED: ${err.message}`);
+        console.log(`  ❌ EXIT ORDER FAILED: ${err.message}`);
         keep.push(pos);
         continue;
       }
     } else {
-      console.log(`  📋 PAPER EXIT — would sell ${pos.quantity.toFixed(6)} ${symbol}`);
+      console.log(`  📋 PAPER EXIT — would ${exitSide} ${pos.quantity.toFixed(6)} ${symbol}`);
     }
 
     recordDailyPnl(symbol, pnlUSD);
     if (pnlUSD > 0) recordWin(symbol); else recordLoss(symbol);
+
     const durationMs = Date.now() - new Date(pos.entryTime).getTime();
     const durationMin = Math.round(durationMs / 60000);
-    closed.push({ symbol, entryPrice: pos.entryPrice, exitPrice: price, pnlUSD, pnlPct, durationMin, reason: exitReason, time: new Date().toISOString() });
+    const closedTrade = {
+      symbol, side: isLong ? "long" : "short",
+      entryPrice: pos.entryPrice, exitPrice: price,
+      pnlUSD, pnlPct, durationMin, reason: exitReason,
+      time: new Date().toISOString(),
+    };
+    closed.push(closedTrade);
+    appendClosedTrade(closedTrade);
+
+    sendAlert(
+      `${pnlUSD >= 0 ? "✅" : "❌"} EXIT ${symbol} (${isLong ? "LONG" : "SHORT"})\n` +
+      `Entry $${pos.entryPrice.toFixed(2)} → Exit $${price.toFixed(2)}\n` +
+      `P&L: ${pnlUSD >= 0 ? "+" : ""}$${pnlUSD.toFixed(2)} (${pnlPct >= 0 ? "+" : ""}${pnlPct.toFixed(2)}%)\n` +
+      exitReason
+    ).catch(() => {});
 
     const now = new Date();
     appendFileSync(CSV_FILE, [
@@ -857,7 +917,7 @@ async function checkExits(symbol, positions, price, ema, vwap, rsi) {
       now.toISOString().slice(11, 19),
       "BitGet",
       symbol,
-      "SELL",
+      exitSide.toUpperCase(),
       pos.quantity.toFixed(6),
       price.toFixed(2),
       (price * pos.quantity).toFixed(2),
@@ -977,7 +1037,7 @@ function writeTradeCsv(logEntry) {
     orderId = "BLOCKED";
     notes = `Failed: ${failed}`;
   } else if (logEntry.paperTrading) {
-    side = "BUY";
+    side = (logEntry.side || "buy").toUpperCase();
     quantity = (logEntry.tradeSize / logEntry.price).toFixed(6);
     totalUSD = logEntry.tradeSize.toFixed(2);
     fee = (logEntry.tradeSize * 0.001).toFixed(4);
@@ -986,7 +1046,7 @@ function writeTradeCsv(logEntry) {
     mode = "PAPER";
     notes = "All conditions met";
   } else {
-    side = "BUY";
+    side = (logEntry.side || "buy").toUpperCase();
     quantity = (logEntry.tradeSize / logEntry.price).toFixed(6);
     totalUSD = logEntry.tradeSize.toFixed(2);
     fee = (logEntry.tradeSize * 0.001).toFixed(4);
@@ -1255,8 +1315,9 @@ async function run() {
     break;
   }
 
-  // 1m bias — calculated once, used for 15m alignment + all downstream checks
+  // 1m bias — calculated once, used for all timeframe alignment + downstream checks
   const bias1m = price > vwap && price > ema8 ? "bullish" : "bearish";
+  const tradeSide = bias1m === "bullish" ? "buy" : "sell";
 
   // 15m bias — required to align with 1m direction (no counter-trend entries)
   try {
@@ -1272,6 +1333,21 @@ async function run() {
     }
   } catch {
     console.log(`  ⚠️  Could not fetch 15m data — allowing entry.`);
+  }
+
+  // 1H bias — big-picture trend must align (multi-timeframe confluence)
+  try {
+    const candles1H = await fetchCandles(symbol, "1H", 30);
+    const closes1H = candles1H.map(c => c.close);
+    const ema8_1H = calcEMA(closes1H, 8);
+    const bias1H = closes1H[closes1H.length - 1] > ema8_1H ? "bullish" : "bearish";
+    console.log(`  1H bias:  ${bias1H.toUpperCase()}`);
+    if (bias1m !== bias1H) {
+      console.log(`  🚫 1H is ${bias1H.toUpperCase()} vs 1m ${bias1m.toUpperCase()} — counter-trend, skipping.`);
+      continue;
+    }
+  } catch {
+    console.log(`  ⚠️  Could not fetch 1H data — allowing entry.`);
   }
 
   // Fear & Greed filter
@@ -1364,6 +1440,7 @@ async function run() {
   const logEntry = {
     timestamp: new Date().toISOString(),
     symbol: symbol,
+    side: tradeSide,
     timeframe: CONFIG.timeframe,
     price,
     indicators: { ema8, vwap, rsi3 },
@@ -1391,33 +1468,42 @@ async function run() {
     // Switch TradingView to this symbol so you can watch the trade live
     await switchTradingViewChart(symbol);
 
+    const dirLabel = tradeSide === "buy" ? "LONG" : "SHORT";
+    const newPos = {
+      symbol, side: tradeSide,
+      entryPrice: price, entryTime: new Date().toISOString(),
+      sizeUSD: tradeSize, quantity: tradeSize / price,
+      ...(tradeSide === "buy" ? { highestPrice: price } : { lowestPrice: price }),
+    };
+
     if (CONFIG.paperTrading) {
-      console.log(
-        `\n📋 PAPER TRADE — would buy ${symbol} ~$${tradeSize.toFixed(2)} at market`,
-      );
+      console.log(`\n📋 PAPER TRADE — ${dirLabel} ${symbol} ~$${tradeSize.toFixed(2)} at market`);
       console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
       logEntry.orderPlaced = true;
       logEntry.orderId = `PAPER-${Date.now()}`;
-      positions.push({ symbol, side: "buy", entryPrice: price, highestPrice: price, entryTime: new Date().toISOString(), sizeUSD: tradeSize, quantity: tradeSize / price });
+      positions.push(newPos);
       savePositions(positions);
       tradedThisCycle.add(symbol);
+      sendAlert(
+        `${tradeSide === "buy" ? "🟢 LONG" : "🔴 SHORT"} ${symbol} @ $${price.toFixed(2)}\n` +
+        `Size: $${tradeSize.toFixed(2)} | PAPER\n` +
+        `F&G: ${fearGreed.value}/100 | Bias: ${bias1m.toUpperCase()}`
+      ).catch(() => {});
     } else {
-      console.log(
-        `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} BUY ${symbol}`,
-      );
+      console.log(`\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} ${dirLabel} ${symbol}`);
       try {
-        const order = await placeBitGetOrder(
-          symbol,
-          "buy",
-          tradeSize,
-          price,
-        );
+        const order = await placeBitGetOrder(symbol, tradeSide, tradeSize, price);
         logEntry.orderPlaced = true;
         logEntry.orderId = order.orderId;
         console.log(`✅ ORDER PLACED — ${order.orderId}`);
-        positions.push({ symbol, side: "buy", entryPrice: price, highestPrice: price, entryTime: new Date().toISOString(), sizeUSD: tradeSize, quantity: tradeSize / price });
+        positions.push(newPos);
         savePositions(positions);
         tradedThisCycle.add(symbol);
+        sendAlert(
+          `${tradeSide === "buy" ? "🟢 LONG" : "🔴 SHORT"} ${symbol} @ $${price.toFixed(2)}\n` +
+          `Size: $${tradeSize.toFixed(2)} | LIVE | ID: ${order.orderId}\n` +
+          `F&G: ${fearGreed.value}/100 | Bias: ${bias1m.toUpperCase()}`
+        ).catch(() => {});
       } catch (err) {
         console.log(`❌ ORDER FAILED — ${err.message}`);
         logEntry.error = err.message;
@@ -1588,6 +1674,7 @@ async function run() {
   writeFileSync("trades-data.json", JSON.stringify({
     trades: log.trades,
     openPositions: positions,
+    closedTrades: loadClosedTrades().slice(-50),
     stats: {
       todayPnl: getTodayPnl(),
       maxDrawdown,

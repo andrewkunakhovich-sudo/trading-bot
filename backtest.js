@@ -100,25 +100,38 @@ function calcADX(candles, period = 14) {
   return Math.abs(plusDI - minusDI) / (plusDI + minusDI) * 100;
 }
 
+const OKX_SYMBOL_MAP = { "MATICUSDT": "POLUSDT" };
+
 async function fetchHistoricalCandles(symbol, days) {
-  const krakenSymbol = symbol.replace("BTC", "XBT").replace("USDT", "USD");
-  // Fetch up to 720 1H candles (~30 days) — Kraken max per request
-  // For longer history, fetch multiple pages using the `since` param
-  const since = Math.floor((Date.now() / 1000) - days * 24 * 3600);
-  const url = `https://api.kraken.com/0/public/OHLC?pair=${krakenSymbol}&interval=60&since=${since}`;
-  console.log(`Fetching ${days}-day 1H history for ${symbol} from Kraken...`);
-  const res = await fetch(url);
-  const data = await res.json();
-  if (data.error?.length) throw new Error(data.error[0]);
-  const pairKey = Object.keys(data.result).find(k => k !== "last");
-  return data.result[pairKey].map(k => ({
-    time: k[0] * 1000,
-    open: parseFloat(k[1]),
-    high: parseFloat(k[2]),
-    low: parseFloat(k[3]),
-    close: parseFloat(k[4]),
-    volume: parseFloat(k[6]),
-  }));
+  const mapped = OKX_SYMBOL_MAP[symbol] || symbol;
+  const instId = mapped.replace("USDT", "-USDT");
+  const totalNeeded = days * 24;
+  const allCandles = [];
+  let after = "";
+
+  console.log(`Fetching ${days}-day 1H history for ${symbol} from OKX...`);
+
+  while (allCandles.length < totalNeeded) {
+    const param = after ? `&after=${after}` : "";
+    const url = `https://www.okx.com/api/v5/market/history-candles?instId=${instId}&bar=1H&limit=300${param}`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (data.code !== "0" || !data.data?.length) break;
+    const batch = data.data.map(k => ({
+      time: parseInt(k[0]),
+      open: parseFloat(k[1]),
+      high: parseFloat(k[2]),
+      low: parseFloat(k[3]),
+      close: parseFloat(k[4]),
+      volume: parseFloat(k[5]),
+    }));
+    allCandles.push(...batch);
+    after = batch[batch.length - 1].time;
+    if (batch.length < 300) break;
+  }
+
+  const cutoff = Date.now() - days * 24 * 3600 * 1000;
+  return allCandles.reverse().filter(c => c.time >= cutoff);
 }
 
 function runBacktest(candles, portfolioValue = 10000, maxTradeSizeUSD = 500) {
@@ -146,8 +159,11 @@ function runBacktest(candles, portfolioValue = 10000, maxTradeSizeUSD = 500) {
       const trailingStop = position.highestPrice * 0.997;
       let exitReason = null;
 
-      if (price <= trailingStop) exitReason = "trailing_stop";
-      else if (rsi3 > 50) exitReason = "rsi_exit";
+      const gainPct = (price - position.entryPrice) / position.entryPrice * 100;
+      if (gainPct <= -1.0) exitReason = "hard_stop";
+      else if (gainPct >= 3.0) exitReason = "take_profit";
+      else if (price <= trailingStop) exitReason = "trailing_stop";
+      else if (rsi3 > 65) exitReason = "rsi_exit";
       else if (price <= vwap) exitReason = "vwap_touch";
       else if (price < ema8) exitReason = "ema_cross";
 
@@ -175,12 +191,12 @@ function runBacktest(candles, portfolioValue = 10000, maxTradeSizeUSD = 500) {
 
       const lastMove = Math.abs((closes[closes.length - 1] - closes[closes.length - 2]) / closes[closes.length - 2] * 100);
       if (lastMove > 2) continue;
-      if (adx !== null && adx < 12) continue;
+      if (adx !== null && adx < 10) continue;
 
       const avgVol = window.slice(-21, -1).reduce((s, c) => s + c.volume, 0) / 20;
-      if (window[window.length - 1].volume < avgVol * 0.8) continue;
+      if (window[window.length - 1].volume < avgVol * 1.0) continue;
 
-      if (bullish && rsi3 < 35 && distFromVWAP < 1.5) {
+      if (bullish && rsi3 < 28 && distFromVWAP < 0.8) {
         const macdOk = macd ? macd.histogram > 0 : true;
         if (!macdOk) continue;
 
