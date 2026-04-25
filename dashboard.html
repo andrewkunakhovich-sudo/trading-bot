@@ -57,6 +57,7 @@
 <div id="crypto-positions" class="section"></div>
 <div id="stock-positions" class="section"></div>
 <div id="closed-trades" class="section"></div>
+<div id="daily-history" class="section"></div>
 <div id="perf-symbol" class="section"></div>
 <div id="perf-hour" class="section"></div>
 <div id="ai-insights" class="section"></div>
@@ -392,14 +393,14 @@ async function load() {
           <td style="color:${runningTotal >= 0 ? '#10b981' : '#ef4444'};font-weight:600">${runningTotal >= 0 ? '+' : ''}$${runningTotal.toFixed(2)}</td>
         </tr>`;
       }).join('');
-      document.getElementById('perf-symbol').insertAdjacentHTML('beforebegin', `
-        <div class="section" id="daily-history">
-          <div class="section-title">Daily P&L History</div>
-          <table>
-            <thead><tr><th>Date</th><th>Day P&L</th><th>Trades</th><th>Win Rate</th><th>Running Total</th></tr></thead>
-            <tbody>${dayRows}</tbody>
-          </table>
-        </div>`);
+      document.getElementById('daily-history').innerHTML = `
+        <div class="section-title">Daily P&L History</div>
+        <table>
+          <thead><tr><th>Date</th><th>Day P&L</th><th>Trades</th><th>Win Rate</th><th>Running Total</th></tr></thead>
+          <tbody>${dayRows}</tbody>
+        </table>`;
+    } else {
+      document.getElementById('daily-history').innerHTML = '';
     }
 
     // Open position cards with live charts
