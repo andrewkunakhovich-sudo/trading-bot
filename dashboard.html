@@ -8,7 +8,7 @@
   body { background: #0f1117; color: #d1d5db; font-family: 'Segoe UI', sans-serif; padding: 24px; }
   h1 { color: #fff; font-size: 22px; margin-bottom: 4px; }
   .subtitle { color: #6b7280; font-size: 13px; margin-bottom: 24px; }
-  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 28px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; margin-bottom: 28px; }
   .card { background: #1a1d27; border: 1px solid #2d3148; border-radius: 10px; padding: 18px; }
   .card-label { font-size: 11px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
   .card-value { font-size: 26px; font-weight: 700; color: #fff; }
@@ -38,6 +38,13 @@
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
   .footer { color: #4b5563; font-size: 12px; margin-top: 20px; }
   .coin-icon { font-size: 16px; margin-right: 6px; }
+  .pos-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 12px; }
+  .pos-card { background: #1a1d27; border: 1px solid #2d3148; border-radius: 10px; overflow: hidden; transition: border-color 0.3s; }
+  .pos-card-header { padding: 14px 16px 8px; display: flex; justify-content: space-between; align-items: center; }
+  .pos-card-body { padding: 0 0 0 0; }
+  .pos-card-stats { padding: 10px 16px 14px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px 16px; border-top: 1px solid #2d3148; }
+  .pos-stat-label { font-size: 10px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.04em; }
+  .pos-stat-value { font-size: 13px; font-weight: 600; color: #fff; margin-top: 2px; }
 </style>
 </head>
 <body>
@@ -57,6 +64,10 @@
 <p class="footer" id="footer"></p>
 
 <script>
+window.onerror = (msg, src, line, col, err) => {
+  document.body.style.padding = '24px';
+  document.body.innerHTML = `<div style="background:#1a0000;color:#ef4444;padding:20px;border-radius:8px;font-family:monospace;white-space:pre-wrap;font-size:13px">JS ERROR (line ${line}:${col})\n${msg}\n\n${err?.stack || ''}</div>`;
+};
 const COIN_ICONS = { BTC:'₿', ETH:'Ξ', SOL:'◎', XRP:'✕', ADA:'₳', DOGE:'Ð', DOT:'●', LINK:'⬡', AVAX:'▲', UNI:'🦄', LTC:'Ł' };
 const STOCK_ICONS = { AAPL:'🍎', TSLA:'⚡', NVDA:'🟢', MSFT:'🪟', AMZN:'📦', META:'🔵', GOOGL:'🔍', NFLX:'🎬', SPY:'📊' };
 const CRYPTO_SUFFIXES = ['USDT','USD','BTC','ETH'];
@@ -73,16 +84,6 @@ async function getCryptoPrice(symbol) {
     if (d.error && d.error.length) return null;
     const key = Object.keys(d.result)[0];
     return parseFloat(d.result[key].c[0]);
-  } catch { return null; }
-}
-
-async function getStockPrice(ticker) {
-  try {
-    // Yahoo Finance public quote endpoint
-    const r = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1m&range=1d`);
-    const d = await r.json();
-    const meta = d.chart?.result?.[0]?.meta;
-    return meta?.regularMarketPrice || meta?.previousClose || null;
   } catch { return null; }
 }
 
@@ -124,13 +125,116 @@ async function loadMorningReport() {
   } catch { document.getElementById('morning-report').innerHTML = ''; }
 }
 
+function drawMiniChart(symbol, closes, entryPrice, trailStop, isLong) {
+  if (!closes || closes.length < 2) return '<div style="height:90px;display:flex;align-items:center;justify-content:center;color:#4b5563;font-size:12px">No chart data</div>';
+  const W = 500, H = 90, rPad = 48;
+  const currentPrice = closes[closes.length - 1];
+  const inProfit = isLong ? currentPrice >= entryPrice : currentPrice <= entryPrice;
+  const lineColor = inProfit ? '#10b981' : '#ef4444';
+  const allP = [...closes, entryPrice, trailStop].filter(Boolean);
+  const spread = (Math.max(...allP) - Math.min(...allP)) * 0.3 || entryPrice * 0.002;
+  const min = Math.min(...allP) - spread, max = Math.max(...allP) + spread;
+  const range = max - min;
+  const toX = i => Math.round((i / (closes.length - 1)) * (W - rPad));
+  const toY = v => Math.round(H - ((v - min) / range) * H);
+  const lastX = toX(closes.length - 1);
+  const entryY = toY(entryPrice);
+  const linePath = closes.map((v, i) => `${i===0?'M':'L'}${toX(i)},${toY(v)}`).join(' ');
+  const areaPath = `M0,${entryY} ` + closes.map((v, i) => `L${toX(i)},${toY(v)}`).join(' ') + ` L${lastX},${entryY} Z`;
+  const currentY = toY(currentPrice);
+  const stopY = trailStop ? toY(trailStop) : null;
+  const pnlPct = isLong ? (currentPrice - entryPrice) / entryPrice * 100 : (entryPrice - currentPrice) / entryPrice * 100;
+  const safeSym = symbol.replace(/[^a-zA-Z0-9]/g, '');
+  const clamp = (y, lo=8, hi=H-8) => Math.max(lo, Math.min(hi, y));
+  return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:90px;display:block" preserveAspectRatio="none">
+    <defs><linearGradient id="g${safeSym}" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="${lineColor}" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="${lineColor}" stop-opacity="0.02"/>
+    </linearGradient></defs>
+    <path d="${areaPath}" fill="url(#g${safeSym})"/>
+    ${stopY!==null?`<line x1="0" y1="${stopY}" x2="${lastX}" y2="${stopY}" stroke="#ef4444" stroke-width="1" stroke-dasharray="3 3" opacity="0.7"/>
+    <text x="${lastX+4}" y="${clamp(stopY+4)}" fill="#ef4444" font-size="9" font-family="monospace">SL</text>`:''}
+    <line x1="0" y1="${entryY}" x2="${lastX}" y2="${entryY}" stroke="#f59e0b" stroke-width="1" stroke-dasharray="4 3" opacity="0.85"/>
+    <text x="${lastX+4}" y="${clamp(entryY+4)}" fill="#f59e0b" font-size="9" font-family="monospace">IN</text>
+    <path d="${linePath}" fill="none" stroke="${lineColor}" stroke-width="1.5"/>
+    <circle cx="${lastX}" cy="${currentY}" r="3" fill="${lineColor}"/>
+    <text x="${lastX+4}" y="${clamp(currentY+4)}" fill="${lineColor}" font-size="9" font-family="monospace" font-weight="bold">${pnlPct>=0?'+':''}${pnlPct.toFixed(2)}%</text>
+  </svg>`;
+}
+
+async function renderPositionCard(pos, priceMap) {
+  const isStock = !isCrypto(pos.symbol);
+  const isShort = pos.side === 'sell';
+  const currentPrice = priceMap[pos.symbol];
+  const pnl = currentPrice ? (isShort ? (pos.entryPrice - currentPrice) : (currentPrice - pos.entryPrice)) * pos.quantity : null;
+  const pnlPct = pnl !== null ? pnl / pos.sizeUSD * 100 : null;
+  const pnlClass = pnl === null ? 'neutral' : pnl >= 0 ? 'up' : 'down';
+  const pnlStr = pnl === null ? '—' : `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`;
+  const pnlPctStr = pnlPct !== null ? ` (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%)` : '';
+  const trailLevel = isShort ? pos.lowestPrice : pos.highestPrice;
+  const trailPct = pos.halfTaken ? 0.003 : 0.006;
+  const trailStop = trailLevel ? (isShort ? trailLevel * (1 + trailPct) : trailLevel * (1 - trailPct)) : null;
+  const dirBadge = isShort ? `<span class="badge short">SHORT</span>` : `<span class="badge long">LONG</span>`;
+  const icon = isStock ? stockIcon(pos.symbol) : coinIcon(pos.symbol);
+  const label = isStock ? pos.symbol : pos.symbol.replace('USDT', '');
+  const sinceMin = pos.entryTime ? Math.round((Date.now() - new Date(pos.entryTime)) / 60000) : null;
+  const borderColor = pnl === null ? '#2d3148' : pnl >= 0 ? '#10b98144' : '#ef444444';
+
+  let chartHtml = '';
+  if (!isStock) {
+    try {
+      const instId = pos.symbol.replace('USDT', '-USDT');
+      const r = await fetch(`https://www.okx.com/api/v5/market/candles?instId=${instId}&bar=1m&limit=60`);
+      const d = await r.json();
+      if (d.code === '0' && d.data?.length > 0) {
+        const closes = d.data.slice().reverse().map(k => parseFloat(k[4]));
+        chartHtml = drawMiniChart(pos.symbol, closes, pos.entryPrice, trailStop, !isShort);
+      }
+    } catch {}
+  }
+  if (!chartHtml) {
+    const pts = currentPrice ? [pos.entryPrice, currentPrice] : [pos.entryPrice];
+    chartHtml = drawMiniChart(pos.symbol, pts, pos.entryPrice, trailStop, !isShort);
+  }
+
+  const statusBit = pos.breakevenSet ? '<span style="color:#f59e0b;font-size:11px">🔒 BE set</span>' : pos.halfTaken ? '<span style="color:#10b981;font-size:11px">½ taken</span>' : '';
+
+  return `<div class="pos-card" style="border-color:${borderColor}">
+    <div class="pos-card-header">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span class="coin-icon">${icon}</span>
+        <strong style="font-size:15px">${label}</strong>
+        ${dirBadge}
+        ${sinceMin !== null ? `<span style="color:#6b7280;font-size:11px">${sinceMin}m</span>` : ''}
+        ${statusBit}
+      </div>
+      <div class="${pnlClass}" style="font-size:17px;font-weight:700">${pnlStr}<span style="font-size:11px;font-weight:400">${pnlPctStr}</span></div>
+    </div>
+    <div class="pos-card-body">${chartHtml}</div>
+    <div class="pos-card-stats">
+      <div><div class="pos-stat-label">Entry</div><div class="pos-stat-value">$${pos.entryPrice.toFixed(4)}</div></div>
+      <div><div class="pos-stat-label">Now</div><div class="pos-stat-value">${currentPrice ? '$'+currentPrice.toFixed(4) : '—'}</div></div>
+      <div><div class="pos-stat-label">Trail Stop</div><div class="pos-stat-value" style="color:#ef4444">${trailStop ? '$'+trailStop.toFixed(4) : '—'}</div></div>
+      <div><div class="pos-stat-label">Size</div><div class="pos-stat-value">$${pos.sizeUSD.toFixed(0)}</div></div>
+      <div><div class="pos-stat-label">Peak</div><div class="pos-stat-value">${trailLevel ? '$'+trailLevel.toFixed(4) : '—'}</div></div>
+      <div><div class="pos-stat-label">Type</div><div class="pos-stat-value" style="color:#6b7280">${isStock ? 'Stock' : 'Crypto'}</div></div>
+    </div>
+  </div>`;
+}
+
 async function load() {
   try {
     const r = await fetch('trades-data.json?' + Date.now());
+    if (!r.ok) {
+      document.getElementById('stats').innerHTML = `<div class="card" style="grid-column:1/-1;text-align:center"><div class="card-label">Status</div><div class="card-value yellow" style="font-size:15px">Bot starting up — waiting for first cycle...</div></div>`;
+      document.getElementById('footer').textContent = `Checked: ${new Date().toLocaleTimeString()} · Retrying in 15s`;
+      return;
+    }
     const raw = await r.json();
     const trades = Array.isArray(raw) ? raw : (raw.trades || []);
     const openPositions = raw.openPositions || [];
     const serverStats = raw.stats || {};
+    const botPrices = raw.lastKnownPrices || {};
     const executed = trades.filter(t => t.orderPlaced);
     const today = new Date().toISOString().slice(0,10);
     const todayTrades = executed.filter(t => t.timestamp.startsWith(today));
@@ -139,18 +243,12 @@ async function load() {
     const cryptoOpen = openPositions.filter(p => isCrypto(p.symbol));
     const stockOpen = openPositions.filter(p => !isCrypto(p.symbol));
 
-    // Fetch live prices for open positions only
+    // Use bot's last known prices (no CORS issues), live-refresh crypto only
     const cryptoSymbols = [...new Set(cryptoOpen.map(p => p.symbol))];
-    const stockSymbols = [...new Set(stockOpen.map(p => p.symbol))];
+    const cryptoPrices = await Promise.all(cryptoSymbols.map(s => getCryptoPrice(s)));
 
-    const [cryptoPrices, stockPrices] = await Promise.all([
-      Promise.all(cryptoSymbols.map(s => getCryptoPrice(s))),
-      Promise.all(stockSymbols.map(s => getStockPrice(s))),
-    ]);
-
-    const priceMap = {};
-    cryptoSymbols.forEach((s, i) => priceMap[s] = cryptoPrices[i]);
-    stockSymbols.forEach((s, i) => priceMap[s] = stockPrices[i]);
+    const priceMap = { ...botPrices };
+    cryptoSymbols.forEach((s, i) => { if (cryptoPrices[i]) priceMap[s] = cryptoPrices[i]; });
 
     // Unrealised P&L on open positions
     let totalPnl = 0, totalInvested = 0;
@@ -171,27 +269,62 @@ async function load() {
     const totalWins = Object.values(bySymbol).reduce((s, v) => s + v.wins, 0);
     const winRate = totalTrades > 0 ? Math.round(totalWins / totalTrades * 100) : null;
 
+    // All-time P&L from daily history
+    const dailyPnl = serverStats.dailyPnl || {};
+    const days = Object.keys(dailyPnl).sort();
+    const allTimePnl = days.reduce((sum, d) => sum + (dailyPnl[d].total || 0), 0);
+    const tradingDays = days.length;
+
+    // Extra stats from closed trades
+    const allClosed = raw.closedTrades || [];
+    const totalClosedTrades = allClosed.length;
+    const bestTrade = allClosed.reduce((best, t) => t.pnlUSD > (best?.pnlUSD || -Infinity) ? t : best, null);
+    const worstTrade = allClosed.reduce((worst, t) => t.pnlUSD < (worst?.pnlUSD || Infinity) ? t : worst, null);
+    const avgWin = totalWins > 0 ? allClosed.filter(t => t.pnlUSD > 0).reduce((s, t) => s + t.pnlUSD, 0) / totalWins : null;
+    const totalLosses = totalClosedTrades - totalWins;
+    const avgLoss = totalLosses > 0 ? allClosed.filter(t => t.pnlUSD <= 0).reduce((s, t) => s + t.pnlUSD, 0) / totalLosses : null;
+
     // Stats cards
     document.getElementById('stats').innerHTML = `
       <div class="card">
-        <div class="card-label">Unrealised P&L</div>
-        <div class="card-value ${totalPnl >= 0 ? 'green' : 'red'}">${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)}</div>
+        <div class="card-label">All-Time P&L</div>
+        <div class="card-value ${allTimePnl >= 0 ? 'green' : 'red'}">${allTimePnl >= 0 ? '+' : ''}$${allTimePnl.toFixed(2)}</div>
+        <div style="font-size:11px;color:#6b7280;margin-top:4px">${tradingDays} day${tradingDays !== 1 ? 's' : ''} · ${totalClosedTrades} closed trades</div>
       </div>
       <div class="card">
         <div class="card-label">Today's Realised P&L</div>
         <div class="card-value ${todayPnl >= 0 ? 'green' : 'red'}">${todayPnl >= 0 ? '+' : ''}$${todayPnl.toFixed(2)}</div>
       </div>
       <div class="card">
+        <div class="card-label">Unrealised P&L</div>
+        <div class="card-value ${totalPnl >= 0 ? 'green' : 'red'}">${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)}</div>
+      </div>
+      <div class="card">
         <div class="card-label">Win Rate</div>
         <div class="card-value ${winRate >= 50 ? 'green' : winRate !== null ? 'red' : ''}">${winRate !== null ? winRate + '%' : '—'}</div>
+        <div style="font-size:11px;color:#6b7280;margin-top:4px">${totalWins}W / ${totalLosses}L</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Best Trade</div>
+        <div class="card-value green">${bestTrade ? '+$' + bestTrade.pnlUSD.toFixed(2) : '—'}</div>
+        <div style="font-size:11px;color:#6b7280;margin-top:4px">${bestTrade ? bestTrade.symbol?.replace('USDT','') : ''}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Worst Trade</div>
+        <div class="card-value red">${worstTrade ? '$' + worstTrade.pnlUSD.toFixed(2) : '—'}</div>
+        <div style="font-size:11px;color:#6b7280;margin-top:4px">${worstTrade ? worstTrade.symbol?.replace('USDT','') : ''}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Avg Win / Avg Loss</div>
+        <div style="display:flex;gap:8px;align-items:baseline;margin-top:6px">
+          <span style="font-size:20px;font-weight:700;color:#10b981">${avgWin !== null ? '+$' + avgWin.toFixed(2) : '—'}</span>
+          <span style="font-size:13px;color:#6b7280">/</span>
+          <span style="font-size:20px;font-weight:700;color:#ef4444">${avgLoss !== null ? '$' + avgLoss.toFixed(2) : '—'}</span>
+        </div>
       </div>
       <div class="card">
         <div class="card-label">Max Drawdown</div>
         <div class="card-value red">${maxDrawdown > 0 ? '-$' + maxDrawdown.toFixed(2) : '—'}</div>
-      </div>
-      <div class="card">
-        <div class="card-label">Sharpe Ratio</div>
-        <div class="card-value ${sharpe > 1 ? 'green' : sharpe !== null ? 'yellow' : ''}">${sharpe !== null ? sharpe : '—'}</div>
       </div>
       <div class="card">
         <div class="card-label">Open Positions</div>
@@ -199,72 +332,82 @@ async function load() {
       </div>
     `;
 
-    // Equity curve from daily P&L
-    const dailyPnl = serverStats.dailyPnl || {};
-    const days = Object.keys(dailyPnl).sort();
-    if (days.length > 1) {
+    // All-time equity curve
+    if (days.length >= 1) {
       let running = 0;
-      const points = days.map(d => { running += dailyPnl[d]; return { d, v: running }; });
-      const min = Math.min(...points.map(p => p.v));
-      const max = Math.max(...points.map(p => p.v));
+      const points = [{ d: 'start', v: 0 }, ...days.map(d => {
+        running += (dailyPnl[d].total || 0);
+        return { d, v: running };
+      })];
+      const W = 800, H = 120, PAD = 8;
+      const vals = points.map(p => p.v);
+      const min = Math.min(0, ...vals);
+      const max = Math.max(0, ...vals);
       const range = max - min || 1;
-      const W = 600, H = 80;
-      const toX = i => Math.round((i / (points.length - 1)) * W);
-      const toY = v => Math.round(H - ((v - min) / range) * H);
-      const path = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${toX(i)},${toY(p.v)}`).join(' ');
-      const lastColor = points[points.length-1].v >= 0 ? '#10b981' : '#ef4444';
+      const toX = i => PAD + Math.round(((i) / (points.length - 1)) * (W - PAD * 2));
+      const toY = v => PAD + Math.round((1 - (v - min) / range) * (H - PAD * 2));
+      const zeroY = toY(0);
+      const linePath = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${toX(i)},${toY(p.v)}`).join(' ');
+      const fillPath = `${linePath} L${toX(points.length-1)},${zeroY} L${toX(0)},${zeroY} Z`;
+      const lastVal = points[points.length - 1].v;
+      const lineColor = lastVal >= 0 ? '#10b981' : '#ef4444';
+      const fillColor = lastVal >= 0 ? 'rgba(16,185,129,0.12)' : 'rgba(239,68,68,0.12)';
+      const firstDate = days[0] || '';
+      const lastDate = days[days.length - 1] || '';
       document.getElementById('equity').innerHTML = `
-        <div class="section-title">Equity Curve</div>
-        <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:80px;background:#1a1d27;border-radius:8px;border:1px solid #2d3148">
-          <line x1="0" y1="${toY(0)}" x2="${W}" y2="${toY(0)}" stroke="#2d3148" stroke-width="1" stroke-dasharray="4"/>
-          <path d="${path}" fill="none" stroke="${lastColor}" stroke-width="2"/>
-        </svg>`;
+        <div class="section-title" style="display:flex;justify-content:space-between;align-items:center">
+          <span>All-Time Equity Curve <span style="color:#6b7280;font-weight:400;text-transform:none;font-size:11px">${tradingDays} day${tradingDays !== 1 ? 's' : ''} trading</span></span>
+          <span style="font-size:15px;font-weight:700;color:${lineColor}">${lastVal >= 0 ? '+' : ''}$${lastVal.toFixed(2)}</span>
+        </div>
+        <div style="background:#1a1d27;border:1px solid #2d3148;border-radius:10px;padding:12px 16px 8px">
+          <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px">
+            <line x1="${PAD}" y1="${zeroY}" x2="${W-PAD}" y2="${zeroY}" stroke="#2d3148" stroke-width="1" stroke-dasharray="4"/>
+            <path d="${fillPath}" fill="${fillColor}"/>
+            <path d="${linePath}" fill="none" stroke="${lineColor}" stroke-width="2.5" stroke-linejoin="round"/>
+            <circle cx="${toX(points.length-1)}" cy="${toY(lastVal)}" r="4" fill="${lineColor}"/>
+          </svg>
+          <div style="display:flex;justify-content:space-between;font-size:11px;color:#4b5563;margin-top:2px;padding:0 ${PAD}px">
+            <span>${firstDate}</span><span>Today</span>
+          </div>
+        </div>`;
     } else {
       document.getElementById('equity').innerHTML = '';
     }
 
-    // Open positions table
-    function posRow(pos, icon, label) {
-      const isShort = pos.side === "sell";
-      const currentPrice = priceMap[pos.symbol];
-      const pnl = currentPrice
-        ? (isShort ? (pos.entryPrice - currentPrice) : (currentPrice - pos.entryPrice)) * pos.quantity
-        : null;
-      const pnlPct = pnl !== null ? (pnl / pos.sizeUSD * 100) : null;
-      const pnlClass = pnl === null ? 'neutral' : pnl >= 0 ? 'up' : 'down';
-      const pnlStr = pnl === null ? '—' : `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} (${pnl >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%)`;
-      const trailLevel = isShort ? pos.lowestPrice : pos.highestPrice;
-      const trailStop = trailLevel
-        ? (isShort ? (trailLevel * 1.003).toFixed(2) : (trailLevel * 0.997).toFixed(2))
-        : '—';
-      const dirBadge = isShort
-        ? `<span class="badge short">SHORT</span>`
-        : `<span class="badge long">LONG</span>`;
-      return `<tr>
-        <td><span class="coin-icon">${icon}</span><strong>${label}</strong> ${dirBadge}</td>
-        <td>$${pos.entryPrice.toFixed(4)}</td>
-        <td>${currentPrice ? '$' + currentPrice.toFixed(4) : '—'}</td>
-        <td>$${pos.sizeUSD.toFixed(2)}</td>
-        <td class="${pnlClass}">${pnlStr}</td>
-        <td style="color:#6b7280">$${trailStop}</td>
-      </tr>`;
+    // Daily P&L history table
+    if (days.length > 0) {
+      let runningTotal = 0;
+      const dayRows = [...days].reverse().map(d => {
+        const day = dailyPnl[d];
+        const pnl = day.total || 0;
+        runningTotal += pnl;
+        const trades = Object.values(day.bySymbol || {}).reduce((s, v) => s + v.trades, 0);
+        const wins = Object.values(day.bySymbol || {}).reduce((s, v) => s + v.wins, 0);
+        const wr = trades > 0 ? Math.round(wins / trades * 100) : null;
+        return `<tr>
+          <td style="color:#9ca3af">${d}</td>
+          <td class="${pnl >= 0 ? 'up' : 'down'}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</td>
+          <td style="color:#6b7280">${trades}</td>
+          <td style="color:#6b7280">${wr !== null ? wr + '%' : '—'}</td>
+          <td style="color:${runningTotal >= 0 ? '#10b981' : '#ef4444'};font-weight:600">${runningTotal >= 0 ? '+' : ''}$${runningTotal.toFixed(2)}</td>
+        </tr>`;
+      }).join('');
+      document.getElementById('perf-symbol').insertAdjacentHTML('beforebegin', `
+        <div class="section" id="daily-history">
+          <div class="section-title">Daily P&L History</div>
+          <table>
+            <thead><tr><th>Date</th><th>Day P&L</th><th>Trades</th><th>Win Rate</th><th>Running Total</th></tr></thead>
+            <tbody>${dayRows}</tbody>
+          </table>
+        </div>`);
     }
 
-    const cryptoRows = cryptoOpen.map(pos => posRow(pos, coinIcon(pos.symbol), pos.symbol.replace('USDT',''))).join('');
-    document.getElementById('crypto-positions').innerHTML = `
-      <div class="section-title">Crypto Positions <span class="tag crypto">CRYPTO</span></div>
-      <table>
-        <thead><tr><th>Coin</th><th>Entry</th><th>Current Price</th><th>Size</th><th>P&L</th><th>Trail Stop</th></tr></thead>
-        <tbody>${cryptoRows || '<tr><td colspan="6" style="color:#6b7280;text-align:center">No open crypto positions</td></tr>'}</tbody>
-      </table>`;
-
-    const stockRows = stockOpen.map(pos => posRow(pos, stockIcon(pos.symbol), pos.symbol)).join('');
-    document.getElementById('stock-positions').innerHTML = `
-      <div class="section-title">Stock Positions <span class="tag stocks">STOCKS</span></div>
-      <table>
-        <thead><tr><th>Ticker</th><th>Entry</th><th>Current Price</th><th>Size</th><th>P&L</th><th>Trail Stop</th></tr></thead>
-        <tbody>${stockRows || '<tr><td colspan="6" style="color:#6b7280;text-align:center">No open stock positions</td></tr>'}</tbody>
-      </table>`;
+    // Open position cards with live charts
+    const posCards = await Promise.all(openPositions.map(pos => renderPositionCard(pos, priceMap)));
+    document.getElementById('crypto-positions').innerHTML = openPositions.length > 0
+      ? `<div class="section-title">Open Positions <span class="tag crypto">LIVE CHARTS</span></div><div class="pos-grid">${posCards.join('')}</div>`
+      : `<div class="section-title">Open Positions</div><div style="background:#1a1d27;border:1px solid #2d3148;border-radius:10px;padding:24px;text-align:center;color:#6b7280">No open positions — bot is scanning for setups</div>`;
+    document.getElementById('stock-positions').innerHTML = '';
 
     // Closed trades
     const closedTrades = (raw.closedTrades || []).slice().reverse();
@@ -383,7 +526,7 @@ async function load() {
 
     document.getElementById('footer').textContent = `Last updated: ${new Date().toLocaleTimeString()} · Auto-refreshes every 15s`;
   } catch(e) {
-    document.getElementById('stats').innerHTML = `<p style="color:#ef4444">Error loading data: ${e.message}</p>`;
+    document.getElementById('stats').innerHTML = `<div style="grid-column:1/-1;background:#1a0000;color:#ef4444;padding:16px;border-radius:8px;font-family:monospace;white-space:pre-wrap;font-size:12px">LOAD ERROR: ${e.message}\n\n${e.stack || ''}</div>`;
   }
 }
 
