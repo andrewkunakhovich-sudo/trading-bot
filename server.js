@@ -7,9 +7,11 @@
 
 import { spawn } from "child_process";
 import { createServer } from "http";
-import { readFileSync, existsSync, writeFileSync, unlinkSync } from "fs";
-import { extname } from "path";
+import { readFileSync, existsSync, writeFileSync, unlinkSync, mkdirSync } from "fs";
+import { extname, join } from "path";
 
+const DATA_DIR = process.env.DATA_DIR || ".";
+if (DATA_DIR !== ".") { try { mkdirSync(DATA_DIR, { recursive: true }); } catch {} }
 const LOCK_FILE = "bot.lock";
 
 const PORT = process.env.PORT || 3000;
@@ -23,18 +25,23 @@ const MIME = {
 };
 
 createServer((req, res) => {
-  let file = req.url === "/" ? "dashboard.html" : req.url.slice(1);
-  file = file.split("?")[0];
-  if (!existsSync(file)) {
+  let name = req.url.split("?")[0];
+  if (name === "/" || name === "") name = "dashboard.html";
+  else name = name.slice(1);
+  // JSON data files live in DATA_DIR (persistent volume); static assets stay in CWD
+  const filePath = extname(name) === ".json" ? join(DATA_DIR, name) : name;
+  if (!existsSync(filePath)) {
     res.writeHead(404);
     res.end("Not found");
     return;
   }
+  const isHtml = extname(name) === ".html";
   res.writeHead(200, {
-    "Content-Type": MIME[extname(file)] || "text/plain",
+    "Content-Type": MIME[extname(name)] || "text/plain",
     "Access-Control-Allow-Origin": "*",
+    ...(isHtml && { "Cache-Control": "no-cache, no-store, must-revalidate" }),
   });
-  res.end(readFileSync(file));
+  res.end(readFileSync(filePath));
 }).listen(PORT, () => {
   console.log(`Dashboard live on port ${PORT}`);
 });
@@ -110,6 +117,24 @@ function scheduleMonthlyYoutubeUpdate() {
 console.log("Bot loop started — firing every 60 seconds.\n");
 runBot();
 setInterval(runBot, INTERVAL_MS);
+
+// Run morning report immediately on startup if it hasn't been generated today
+const morningReportFile = join(DATA_DIR, "morning-report.json");
+if (!existsSync(morningReportFile)) {
+  console.log("No morning report found — generating now...");
+  runMorningReport();
+} else {
+  try {
+    const report = JSON.parse(readFileSync(morningReportFile, "utf8"));
+    const reportDate = report.date || "";
+    const today = new Date().toISOString().slice(0, 10);
+    if (reportDate !== today) {
+      console.log("Morning report is stale — regenerating...");
+      runMorningReport();
+    }
+  } catch { runMorningReport(); }
+}
+
 scheduleMorningReport();
 scheduleWeeklyLearn();
 scheduleMonthlyYoutubeUpdate();
